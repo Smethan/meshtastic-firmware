@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Meshtastic firmware
+Source: https://github.com/meshtastic/firmware
+License: GPL-3.0-only
+
+Files: *
+Copyright: Meshtastic contributors
+License: GPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the Free
+ Software Foundation, version 3.
+ .
+ The complete license is installed at /usr/share/common-licenses/GPL-3.

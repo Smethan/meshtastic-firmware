@@ -1,0 +1,2 @@
+d /run/lock/watchdogs 0770 root watchdogs -
+d /run/meshtasticd 0770 meshtasticd meshtasticd -

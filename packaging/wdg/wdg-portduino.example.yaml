@@ -1,0 +1,11 @@
+phone_ble:
+  enabled: true
+  adapter_address: auto
+  pairing_window_seconds: 120
+  max_bonds: 1
+wdg_api:
+  enabled: true
+  socket_path: /run/meshtasticd/wdg.sock
+  allowed_uid: 1000
+full_client_policy:
+  ble_priority: true

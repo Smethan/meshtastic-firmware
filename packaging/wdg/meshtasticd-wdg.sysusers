@@ -1,0 +1,7 @@
+g watchdogs -
+g spi -
+g gpio -
+u meshtasticd - "Meshtastic daemon" /var/lib/meshtasticd /usr/sbin/nologin
+m meshtasticd watchdogs
+m meshtasticd spi
+m meshtasticd gpio

@@ -1,0 +1,29 @@
+[Unit]
+Description=Meshtastic daemon for WatchDogsGo
+Wants=bluetooth.service
+After=bluetooth.service meshtasticd.service
+Conflicts=meshtasticd.service
+StartLimitIntervalSec=200
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=meshtasticd
+Group=meshtasticd
+SupplementaryGroups=spi gpio watchdogs
+RuntimeDirectory=meshtasticd
+RuntimeDirectoryMode=0770
+UMask=0007
+Environment=MESHTASTIC_WDG_POLICY=/etc/meshtasticd/wdg-portduino.yaml
+ExecStartPre=/usr/bin/test -r /etc/meshtasticd/config.yaml
+ExecStart=/usr/bin/flock -n -E 75 /run/lock/watchdogs/aio-sx1262.lock /usr/lib/meshtasticd-wdg/meshtasticd --config=/etc/meshtasticd/config.yaml --fsdir=/var/lib/meshtasticd
+Restart=on-failure
+RestartSec=3
+RestartPreventExitStatus=75
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

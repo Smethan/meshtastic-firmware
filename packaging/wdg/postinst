@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+case "${1:-}" in
+  configure|reconfigure)
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+      systemd-sysusers /usr/lib/sysusers.d/meshtasticd-wdg.conf
+    fi
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+      systemd-tmpfiles --create /usr/lib/tmpfiles.d/meshtasticd-wdg.conf
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+exit 0

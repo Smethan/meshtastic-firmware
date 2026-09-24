@@ -1,0 +1,126 @@
+name: WDG Portduino
+
+on:
+  push:
+    branches: [wdg-main, wdg-portduino-bluez]
+    tags: ['v*.*.*-wdg.*']
+  pull_request:
+    branches: [wdg-main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wdg-portduino-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Formatting and policy
+        uses: trunk-io/trunk-action@v2.0.0
+        with:
+          cache: false
+      - name: Package policy
+        run: ./packaging/wdg/test-package.sh
+
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git python3-pip pkg-config \
+            libbluetooth-dev libgpiod-dev libyaml-cpp-dev libjsoncpp-dev \
+            libssl-dev libulfius-dev liborcania-dev libusb-1.0-0-dev \
+            libi2c-dev libuv1-dev libcurl4-gnutls-dev libsdbus-c++-dev
+          python3 -m pip install --break-system-packages platformio
+      - name: Restore PlatformIO cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio/.cache
+          key: wdg-native-${{ runner.os }}-${{ hashFiles('platformio.ini', 'variants/native/**/*.ini') }}
+          restore-keys: wdg-native-${{ runner.os }}-
+      - name: Build ordinary native
+        run: pio run -e native
+      - name: Build WDG native
+        run: pio run -e native-wdg
+      - name: Config validation
+        run: ./bin/test-config-check.sh .pio/build/native-wdg/meshtasticd
+      - name: Complete native tests
+        run: ./bin/run-tests.sh
+
+  package-arm64:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [policy, native]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    container: debian:bookworm
+    permissions:
+      contents: write
+    steps:
+      - name: Install checkout prerequisites
+        run: apt-get update && apt-get install -y git ca-certificates
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Bookworm ARM64 build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential python3 python3-pip python3-venv pkg-config \
+            dpkg-dev libbluetooth-dev libgpiod-dev libyaml-cpp-dev \
+            libjsoncpp-dev libssl-dev libulfius-dev liborcania-dev \
+            libusb-1.0-0-dev libi2c-dev libuv1-dev libcurl4-gnutls-dev \
+            libsdbus-c++-dev binutils gh
+          python3 -m venv /opt/pio
+          /opt/pio/bin/pip install platformio
+      - name: Build ARM64 native-wdg
+        run: /opt/pio/bin/pio run -e native-wdg
+      - name: Build side-by-side Debian package
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v2.8.0-wdg.0' }}
+        run: ./packaging/wdg/build-deb.sh "$RELEASE_TAG"
+      - name: Install package in clean Bookworm container
+        run: |
+          deb=$(find dist -maxdepth 1 -name 'meshtasticd-wdg_*_arm64.deb' -print -quit)
+          test -n "$deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          dpkg --unpack "$deb"
+          test -x /usr/lib/meshtasticd-wdg/meshtasticd
+          test -f /usr/lib/systemd/system/meshtasticd-wdg.service
+          test ! -e /usr/bin/meshtasticd
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshtasticd-wdg-arm64
+          path: |
+            dist/meshtasticd-wdg_*_arm64.deb
+            dist/compatibility.json
+            dist/SHA256SUMS
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/meshtasticd-wdg_*_arm64.deb
+          dist/compatibility.json
+          dist/SHA256SUMS
+          --repo Smethan/meshtastic-firmware
+          --verify-tag
+          --generate-notes
