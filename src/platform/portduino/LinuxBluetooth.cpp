@@ -79,6 +79,7 @@ constexpr const char *kIfaceObjectManager = "org.freedesktop.DBus.ObjectManager"
 constexpr const char *kIfaceProperties = "org.freedesktop.DBus.Properties";
 
 constexpr size_t kFromPhoneQueueDepth = 3;
+constexpr uint32_t kPairingPolicyPollMsec = 250;
 
 using PropertyMap = std::map<std::string, sdbus::Variant>;
 using InterfaceMap = std::map<std::string, PropertyMap>;
@@ -128,12 +129,27 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     std::atomic<bool> draining{false}; // deinit in progress: fail reads fast
     std::atomic<bool> advertisingUpdatePending{false};
     bool fullClientSuspended = false; // cooperative firmware thread only
+    bool scanSuspended = false;       // cooperative firmware thread only
+
+    // Pairability is opt-in. The event-loop thread may request closure after a
+    // successful bond, but only the cooperative firmware thread calls BlueZ.
+    bool pairingWindowRequested = false;
+    bool pairingAgentSuspended = false;
+    uint32_t pairingWindowStartedMsec = 0;
+    uint32_t pairingWindowDurationMsec = 0;
+    std::atomic<bool> pairingWindowActive{false};
+    std::atomic<bool> pairingClosePending{false};
 
     // Connected/known devices, mutated on the event-loop thread, read from the
     // main thread.
     std::mutex devMutex;
     std::set<std::string> connectedDevices;
+    std::set<std::string> bondedDevices;
+    std::string pairingCandidate;
     std::map<std::string, std::unique_ptr<sdbus::IProxy>> deviceProxies;
+
+    std::mutex policyMutex;
+    std::set<std::string> unauthorizedDevices;
 
     // PHONE -> RADIO queue (WriteValue -> handleToRadio)
     std::mutex fromPhoneMutex;
@@ -178,6 +194,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     std::atomic<bool> passkeyShowPending{false};
     std::atomic<bool> passkeyHidePending{false};
     std::atomic<uint32_t> pendingPasskey{0};
+    std::atomic<uint64_t> passkeyChangeToken{0};
     bool passkeyShowing = false; // main thread only
 
     // ---------------------------------------------------------------- PhoneAPI
@@ -223,19 +240,25 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
 
         updatePasskeyAlert();
 
+        if (pairingClosePending.exchange(false) || pairingWindowExpired())
+            closePairingWindowPolicy(true);
+        disconnectUnauthorizedDevices();
+
         if (advertisingUpdatePending.exchange(false)) {
-            if (checkIsConnected() || fullClientSuspended)
+            if (checkIsConnected() || fullClientSuspended || scanSuspended)
                 unregisterAdvertisement();
             else
                 registerAdvertisement();
         }
+
+        const int32_t nextPolicyCheck = pairingWindowRequested ? kPairingPolicyPollMsec : INT32_MAX;
 
         // Only the current full-client lease holder may touch PhoneAPI state.
         // Ownership itself may be changed by the BlueZ event-loop thread, but
         // all core processing below remains on this cooperative firmware thread.
         if (!meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::BLUETOOTH,
                                                                  this))
-            return INT32_MAX;
+            return nextPolicyCheck;
 
         // Writes before reads: clients send a ToRadio write and immediately read
         // the response, so the parked read must observe the write's effect.
@@ -243,7 +266,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         completeParkedRead();
         refillPrefetch();
 
-        return INT32_MAX; // woken explicitly by the event-loop thread
+        return nextPolicyCheck;
     }
 
     /// Put the pairing code on screen, or take it back down. Main thread only.
@@ -496,15 +519,15 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     // ------------------------------------------------------------ device
     // tracking
 
-    void trackDevice(const std::string &path, bool connectedNow)
+    void trackDevice(const std::string &path, bool pairedNow)
     {
         // LOCK ORDER: devMutex must stay a leaf on the main thread (the event-loop
         // thread takes it inside its dispatch lock), so the proxy - a D-Bus
         // operation - is created outside the lock.
         {
             std::lock_guard<std::mutex> guard(devMutex);
-            if (connectedNow)
-                connectedDevices.insert(path);
+            if (pairedNow)
+                bondedDevices.insert(path);
             if (deviceProxies.count(path) != 0)
                 return;
         }
@@ -518,8 +541,27 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 // Connected so a bond that completes without a state change still
                 // clears the alert.
                 auto paired = changed.find("Paired");
-                if (paired != changed.end() && paired->second.get<bool>())
-                    dismissPasskey();
+                if (paired != changed.end()) {
+                    const bool pairedNow = paired->second.get<bool>();
+                    {
+                        std::lock_guard<std::mutex> guard(devMutex);
+                        if (pairedNow)
+                            bondedDevices.insert(path);
+                        else
+                            bondedDevices.erase(path);
+                    }
+                    if (pairedNow) {
+                        {
+                            std::lock_guard<std::mutex> guard(devMutex);
+                            if (pairingCandidate == path)
+                                pairingCandidate.clear();
+                        }
+                        dismissPasskey();
+                        pairingWindowActive = false;
+                        pairingClosePending = true;
+                        wakeMainLoop();
+                    }
+                }
                 auto it = changed.find("Connected");
                 if (it != changed.end())
                     onDeviceConnectedChanged(path, it->second.get<bool>());
@@ -533,17 +575,36 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     void onDeviceConnectedChanged(const std::string &path, bool connected)
     {
         bool lastGone = false;
+        bool authorized = true;
         {
             std::lock_guard<std::mutex> guard(devMutex);
-            if (connected)
-                connectedDevices.insert(path);
-            else
+            if (connected) {
+                authorized = bondedDevices.count(path) != 0;
+                if (!authorized && pairingWindowActive.load() && (pairingCandidate.empty() || pairingCandidate == path)) {
+                    pairingCandidate = path;
+                    authorized = true;
+                }
+                if (authorized)
+                    connectedDevices.insert(path);
+            } else {
                 connectedDevices.erase(path);
+                if (pairingCandidate == path)
+                    pairingCandidate.clear();
+            }
             lastGone = connectedDevices.empty();
         }
         LOG_INFO("BLE %s %s", connected ? "connect" : "disconnect", path.c_str());
 
         if (connected) {
+            if (!authorized) {
+                LOG_WARN("BLE reject unbonded connection outside pairing window: %s", path.c_str());
+                {
+                    std::lock_guard<std::mutex> guard(policyMutex);
+                    unauthorizedDevices.insert(path);
+                }
+                wakeMainLoop();
+                return;
+            }
             // Thread-safe state only. A TCP PhoneAPI observes the preemption and
             // closes itself from the cooperative firmware thread.
             meshtastic::portduino::fullPhoneApiLease().acquireBluetooth(this);
@@ -581,10 +642,14 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         if (it == interfaces.end() || !belongsToAdapter(path))
             return;
         bool connectedNow = false;
+        bool pairedNow = false;
         auto prop = it->second.find("Connected");
         if (prop != it->second.end())
             connectedNow = prop->second.get<bool>();
-        trackDevice(path, connectedNow);
+        prop = it->second.find("Paired");
+        if (prop != it->second.end())
+            pairedNow = prop->second.get<bool>();
+        trackDevice(path, pairedNow);
         if (connectedNow)
             onDeviceConnectedChanged(path, true);
     }
@@ -596,6 +661,9 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         onDeviceConnectedChanged(path, false);
         std::lock_guard<std::mutex> guard(devMutex);
         deviceProxies.erase(path);
+        bondedDevices.erase(path);
+        if (pairingCandidate == path)
+            pairingCandidate.clear();
     }
 
     bool belongsToAdapter(const std::string &path) const { return path.rfind(adapterPath + "/", 0) == 0; }
@@ -617,8 +685,127 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             bluetoothStatus->updateStatus(&newStatus);
         }
         pendingPasskey = passkey;
+        passkeyChangeToken.fetch_add(1, std::memory_order_release);
         passkeyShowPending = true;
         wakeMainLoop();
+    }
+
+    bool hasBondedPhone()
+    {
+        std::lock_guard<std::mutex> guard(devMutex);
+        return !bondedDevices.empty();
+    }
+
+    bool pairingWindowExpired() const
+    {
+        return pairingWindowRequested && static_cast<uint32_t>(millis() - pairingWindowStartedMsec) >= pairingWindowDurationMsec;
+    }
+
+    bool openPairingWindowPolicy(uint32_t seconds)
+    {
+        if (!enabled || pairingAgentSuspended || seconds == 0 || hasBondedPhone())
+            return false;
+
+        seconds = std::min(seconds, LinuxBluetooth::MAX_PAIRING_WINDOW_SECONDS);
+        pairingWindowRequested = true;
+        pairingWindowStartedMsec = millis();
+        pairingWindowDurationMsec = seconds * 1000U;
+
+        if (!registerAgent() || !setAdapterPairable(true)) {
+            closePairingWindowPolicy(true);
+            return false;
+        }
+
+        pairingWindowActive = true;
+        setIntervalFromNow(kPairingPolicyPollMsec);
+        LOG_INFO("BLE pairing window open for %u seconds", seconds);
+        return true;
+    }
+
+    void closePairingWindowPolicy(bool clearRequest)
+    {
+        pairingWindowActive = false;
+        if (clearRequest) {
+            pairingWindowRequested = false;
+            pairingWindowDurationMsec = 0;
+        }
+        setAdapterPairable(false);
+        unregisterAgent();
+        dismissPasskey();
+
+        std::string unpairedCandidate;
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (!pairingCandidate.empty() && bondedDevices.count(pairingCandidate) == 0) {
+                unpairedCandidate = pairingCandidate;
+                pairingCandidate.clear();
+            }
+        }
+        if (!unpairedCandidate.empty()) {
+            std::lock_guard<std::mutex> guard(policyMutex);
+            unauthorizedDevices.insert(unpairedCandidate);
+        }
+    }
+
+    void setPairingAgentSuspendedPolicy(bool suspended)
+    {
+        if (pairingAgentSuspended == suspended)
+            return;
+        pairingAgentSuspended = suspended;
+        if (suspended) {
+            // Preserve the requested window and its original deadline while an
+            // external local pairing agent owns BlueZ.
+            closePairingWindowPolicy(false);
+        } else if (pairingWindowRequested && !pairingWindowExpired() && !hasBondedPhone()) {
+            if (registerAgent() && setAdapterPairable(true))
+                pairingWindowActive = true;
+            else
+                closePairingWindowPolicy(true);
+        } else {
+            closePairingWindowPolicy(true);
+        }
+    }
+
+    void setScanSuspendedPolicy(bool suspended)
+    {
+        scanSuspended = suspended;
+        if (suspended)
+            unregisterAdvertisement();
+        else
+            registerAdvertisement();
+    }
+
+    bool getLatestPasskey(uint32_t &passkey, uint64_t &changeToken) const
+    {
+        uint64_t before;
+        uint64_t after;
+        do {
+            before = passkeyChangeToken.load(std::memory_order_acquire);
+            passkey = pendingPasskey.load();
+            after = passkeyChangeToken.load(std::memory_order_acquire);
+        } while (before != after);
+        changeToken = after;
+        return after != 0;
+    }
+
+    void disconnectUnauthorizedDevices()
+    {
+        std::set<std::string> pending;
+        {
+            std::lock_guard<std::mutex> guard(policyMutex);
+            pending.swap(unauthorizedDevices);
+        }
+        if (!conn)
+            return;
+        for (const auto &path : pending) {
+            try {
+                auto proxy = sdbuscompat::makeProxy(*conn, kBluezService, path);
+                sdbuscompat::finishProxy(*proxy);
+                proxy->callMethod("Disconnect").onInterface(kIfaceDevice);
+            } catch (const sdbus::Error &e) {
+                LOG_DEBUG("BLE rejected-device disconnect ended: %s", e.getMessage().c_str());
+            }
+        }
     }
 
     // ----------------------------------------------------------------- lifecycle
@@ -657,7 +844,9 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             adapterProxy->setProperty("Powered").onInterface(kIfaceAdapter).toValue(true);
             try {
                 adapterProxy->setProperty("Alias").onInterface(kIfaceAdapter).toValue(deviceName);
-                adapterProxy->setProperty("Pairable").onInterface(kIfaceAdapter).toValue(true);
+                // Advertising remains available for bonded reconnects, but an
+                // unbonded phone may pair only during an explicit WDG window.
+                adapterProxy->setProperty("Pairable").onInterface(kIfaceAdapter).toValue(false);
             } catch (const sdbus::Error &e) {
                 LOG_WARN("BLE could not set adapter alias/pairable: %s", e.what());
             }
@@ -672,7 +861,6 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             exportAdvertisement();
 
             registerApplication();
-            registerAgent();
 
             // Track already-known devices (and any live connection) before
             // advertising.
@@ -684,7 +872,11 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 auto prop = dev->second.find("Connected");
                 if (prop != dev->second.end())
                     connectedNow = prop->second.get<bool>();
-                trackDevice(entry.first, connectedNow);
+                bool pairedNow = false;
+                prop = dev->second.find("Paired");
+                if (prop != dev->second.end())
+                    pairedNow = prop->second.get<bool>();
+                trackDevice(entry.first, pairedNow);
                 if (connectedNow)
                     onDeviceConnectedChanged(entry.first, true);
             }
@@ -710,8 +902,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                                sdbuscompat::property("Primary", [] { return true; }));
 
         const bool pin = pinPairing();
-        const std::vector<std::string> readFlags{pin ? "encrypt-authenticated-read" : "read"};
-        const std::vector<std::string> writeFlags{pin ? "encrypt-authenticated-write" : "write"};
+        const std::vector<std::string> readFlags{pin ? "encrypt-authenticated-read" : "encrypt-read"};
+        const std::vector<std::string> writeFlags{pin ? "encrypt-authenticated-write" : "encrypt-write"};
         std::vector<std::string> notifyFlags = readFlags;
         notifyFlags.push_back("notify");
 
@@ -831,30 +1023,62 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         appRegistered = true;
     }
 
-    void registerAgent()
+    bool registerAgent()
     {
-        agentManagerProxy = sdbuscompat::makeProxy(*conn, kBluezService, kBluezManagerPath);
-        sdbuscompat::finishProxy(*agentManagerProxy);
-        const std::string capability = pinPairing() ? "DisplayOnly" : "NoInputNoOutput";
-        agentManagerProxy->callMethod("RegisterAgent")
-            .onInterface(kIfaceAgentManager)
-            .withArguments(sdbus::ObjectPath{kAgentPath}, capability);
-        agentRegistered = true;
+        if (agentRegistered)
+            return true;
+        if (!conn)
+            return false;
         try {
-            // Make our agent answer this host's pairing requests while BLE is
-            // enabled; without this, headless systems have no agent at all and
-            // pairing fails.
+            if (!agentManagerProxy) {
+                agentManagerProxy = sdbuscompat::makeProxy(*conn, kBluezService, kBluezManagerPath);
+                sdbuscompat::finishProxy(*agentManagerProxy);
+            }
+            const std::string capability = pinPairing() ? "DisplayOnly" : "NoInputNoOutput";
+            agentManagerProxy->callMethod("RegisterAgent")
+                .onInterface(kIfaceAgentManager)
+                .withArguments(sdbus::ObjectPath{kAgentPath}, capability);
+            agentRegistered = true;
             agentManagerProxy->callMethod("RequestDefaultAgent")
                 .onInterface(kIfaceAgentManager)
                 .withArguments(sdbus::ObjectPath{kAgentPath});
+            return true;
         } catch (const sdbus::Error &e) {
-            LOG_WARN("BLE could not become default pairing agent: %s", e.getMessage().c_str());
+            LOG_WARN("BLE could not register pairing agent: %s", e.getMessage().c_str());
+            unregisterAgent();
+            return false;
+        }
+    }
+
+    void unregisterAgent()
+    {
+        if (!agentRegistered.exchange(false) || !agentManagerProxy)
+            return;
+        try {
+            agentManagerProxy->callMethod("UnregisterAgent")
+                .onInterface(kIfaceAgentManager)
+                .withArguments(sdbus::ObjectPath{kAgentPath});
+        } catch (const sdbus::Error &e) {
+            LOG_DEBUG("BLE pairing agent was already unavailable: %s", e.getMessage().c_str());
+        }
+    }
+
+    bool setAdapterPairable(bool pairable)
+    {
+        if (!adapterProxy)
+            return false;
+        try {
+            adapterProxy->setProperty("Pairable").onInterface(kIfaceAdapter).toValue(pairable);
+            return true;
+        } catch (const sdbus::Error &e) {
+            LOG_WARN("BLE could not set Pairable=%s: %s", pairable ? "true" : "false", e.getMessage().c_str());
+            return false;
         }
     }
 
     void registerAdvertisement()
     {
-        if (!enabled || advertising || fullClientSuspended || checkIsConnected() ||
+        if (!enabled || advertising || fullClientSuspended || scanSuspended || checkIsConnected() ||
             meshtastic::portduino::fullPhoneApiLease().owner() != meshtastic::portduino::FullPhoneApiLease::Owner::NONE)
             return;
         advertising = true;
@@ -910,15 +1134,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         updatePasskeyAlert();
         failParkedRead();
         close();
+        closePairingWindowPolicy(true);
         unregisterAdvertisement();
-        if (agentRegistered.exchange(false)) {
-            try {
-                agentManagerProxy->callMethod("UnregisterAgent")
-                    .onInterface(kIfaceAgentManager)
-                    .withArguments(sdbus::ObjectPath{kAgentPath});
-            } catch (const sdbus::Error &) {
-            }
-        }
         if (appRegistered.exchange(false)) {
             try {
                 adapterProxy->callMethod("UnregisterApplication")
@@ -946,6 +1163,12 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             std::lock_guard<std::mutex> guard(devMutex);
             doomed.swap(deviceProxies);
             connectedDevices.clear();
+            bondedDevices.clear();
+            pairingCandidate.clear();
+        }
+        {
+            std::lock_guard<std::mutex> guard(policyMutex);
+            unauthorizedDevices.clear();
         }
         agentManagerProxy.reset();
         adapterProxy.reset();
@@ -963,6 +1186,12 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         enabled = false;
         advertising = false;
         advertisingUpdatePending = false;
+        scanSuspended = false;
+        pairingWindowRequested = false;
+        pairingWindowActive = false;
+        pairingClosePending = false;
+        pairingAgentSuspended = false;
+        pairingWindowDurationMsec = 0;
         agentRegistered = false;
         appRegistered = false;
     }
@@ -973,6 +1202,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             LOG_WARN("BLE clearBonds: Bluetooth is not running, nothing to clear");
             return;
         }
+        closePairingWindowPolicy(true);
         try {
             ManagedObjects objects;
             bluezRootProxy->callMethod("GetManagedObjects").onInterface(kIfaceObjectManager).storeResultsTo(objects);
@@ -986,6 +1216,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 LOG_INFO("BLE removing bond %s", entry.first.c_str());
                 try {
                     adapterProxy->callMethod("RemoveDevice").onInterface(kIfaceAdapter).withArguments(entry.first);
+                    std::lock_guard<std::mutex> guard(devMutex);
+                    bondedDevices.erase(entry.first);
                 } catch (const sdbus::Error &e) {
                     LOG_WARN("BLE could not remove %s: %s", entry.first.c_str(), e.getMessage().c_str());
                 }
@@ -1037,6 +1269,51 @@ void LinuxBluetooth::resumeAdvertising()
 void LinuxBluetooth::setFullClientSuspended(bool suspended)
 {
     impl->setFullClientSuspended(suspended);
+}
+
+void LinuxBluetooth::setScanSuspended(bool suspended)
+{
+    impl->setScanSuspendedPolicy(suspended);
+}
+
+void LinuxBluetooth::retrySharedAdapter()
+{
+    impl->setScanSuspendedPolicy(false);
+}
+
+void LinuxBluetooth::setPairingAgentSuspended(bool suspended)
+{
+    impl->setPairingAgentSuspendedPolicy(suspended);
+}
+
+bool LinuxBluetooth::openPairingWindow(uint32_t seconds)
+{
+    return impl->openPairingWindowPolicy(seconds);
+}
+
+void LinuxBluetooth::closePairingWindow()
+{
+    impl->closePairingWindowPolicy(true);
+}
+
+bool LinuxBluetooth::isPairingWindowOpen() const
+{
+    return impl->pairingWindowActive;
+}
+
+bool LinuxBluetooth::hasBondedPhone() const
+{
+    return impl->hasBondedPhone();
+}
+
+bool LinuxBluetooth::getLatestPasskey(uint32_t &passkey, uint64_t &changeToken) const
+{
+    return impl->getLatestPasskey(passkey, changeToken);
+}
+
+bool LinuxBluetooth::isAdvertising() const
+{
+    return impl->advertising;
 }
 
 void LinuxBluetooth::deinit()

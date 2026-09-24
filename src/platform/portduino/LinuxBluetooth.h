@@ -32,6 +32,8 @@
 class LinuxBluetooth
 {
   public:
+    static constexpr uint32_t MAX_PAIRING_WINDOW_SECONDS = 120;
+
     LinuxBluetooth();
     ~LinuxBluetooth();
 
@@ -48,6 +50,26 @@ class LinuxBluetooth
     /// process-wide full-client lease. Called only by the cooperative firmware
     /// thread; a connected BLE phone remains connected.
     void setFullClientSuspended(bool suspended);
+    /// Suppress advertising for a bounded host-controller scan without
+    /// disconnecting an established phone session.
+    void setScanSuspended(bool suspended);
+    /// Clear the session-only scan suppression and try advertising again.
+    void retrySharedAdapter();
+    /// Temporarily yield BlueZ's default pairing-agent role to another local
+    /// process. An unexpired explicit pairing window is restored on release.
+    void setPairingAgentSuspended(bool suspended);
+
+    /// Open an explicit unbonded-phone pairing window. The duration is capped
+    /// at MAX_PAIRING_WINDOW_SECONDS and the window also expires internally.
+    bool openPairingWindow(uint32_t seconds);
+    void closePairingWindow();
+    bool isPairingWindowOpen() const;
+    bool hasBondedPhone() const;
+    /// Return the most recent BlueZ passkey and its monotonic change token.
+    /// A false return means BlueZ has not supplied a passkey this process run.
+    bool getLatestPasskey(uint32_t &passkey, uint64_t &changeToken) const;
+
+    bool isAdvertising() const;
     /// Full teardown: unregister everything and drop the bus connection.
     void deinit();
 
