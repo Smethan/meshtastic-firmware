@@ -115,6 +115,9 @@ NRF54L15Bluetooth *nrf54l15Bluetooth = nullptr;
 #include "mesh/raspihttp/PiWebServer.h"
 #endif
 #include "platform/portduino/PortduinoGlue.h"
+#if defined(MESHTASTIC_WDG_API) && defined(__linux__)
+#include "platform/portduino/WdgApi.h"
+#endif
 #ifdef _WIN32
 #include "platform/portduino/windows/WindowsService.h"
 #endif
@@ -122,6 +125,10 @@ NRF54L15Bluetooth *nrf54l15Bluetooth = nullptr;
 #include <fstream>
 #include <iostream>
 #include <string>
+#endif
+
+#if defined(MESHTASTIC_WDG_API) && defined(__linux__)
+static meshtastic::portduino::WdgApi *wdgApi = nullptr;
 #endif
 
 #ifdef ARCH_ESP32
@@ -1197,7 +1204,7 @@ void setup()
 
 #ifndef ARCH_PORTDUINO
 
-        // Initialize Wifi
+    // Initialize Wifi
 #if HAS_WIFI
     initWifi();
 #endif
@@ -1276,6 +1283,16 @@ void setup()
 #if defined(ARCH_PORTDUINO) && defined(_WIN32)
     // The node is up; let the SCM stop waiting on START_PENDING. No-op unless --service.
     windowsServiceReportRunning();
+#endif
+
+#if defined(MESHTASTIC_WDG_API) && defined(__linux__)
+    wdgApi = new meshtastic::portduino::WdgApi();
+    if (!wdgApi->start())
+        LOG_WARN("WDG API will retry after startup");
+    std::atexit([] {
+        delete wdgApi;
+        wdgApi = nullptr;
+    });
 #endif
 }
 
