@@ -14,6 +14,10 @@ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSTh
 {
   private:
     T client;
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    bool ownsFullPhoneApiLease = false;
+    void releaseFullPhoneApiLease();
+#endif
 
   public:
     explicit ServerAPI(T &_client);

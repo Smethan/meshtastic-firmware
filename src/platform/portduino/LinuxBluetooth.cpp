@@ -4,6 +4,7 @@
 
 #include "BluetoothCommon.h"
 #include "BluetoothStatus.h"
+#include "FullPhoneApiLease.h"
 #include "PortduinoGlue.h"
 #include "PowerFSM.h"
 #include "SdbusCompat.h"
@@ -125,6 +126,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     std::atomic<bool> agentRegistered{false};
     std::atomic<bool> appRegistered{false};
     std::atomic<bool> draining{false}; // deinit in progress: fail reads fast
+    std::atomic<bool> advertisingUpdatePending{false};
+    bool fullClientSuspended = false; // cooperative firmware thread only
 
     // Connected/known devices, mutated on the event-loop thread, read from the
     // main thread.
@@ -209,9 +212,30 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             }
             std::lock_guard<std::mutex> guard(readMutex);
             prefetched.clear();
+
+            // Keep the BLE lease until PhoneAPI state has been reset on this
+            // cooperative firmware thread. Releasing it from the D-Bus callback
+            // could let TCP start against half-cleaned global phone queues.
+            if (!checkIsConnected())
+                meshtastic::portduino::fullPhoneApiLease().release(meshtastic::portduino::FullPhoneApiLease::Owner::BLUETOOTH,
+                                                                   this);
         }
 
         updatePasskeyAlert();
+
+        if (advertisingUpdatePending.exchange(false)) {
+            if (checkIsConnected() || fullClientSuspended)
+                unregisterAdvertisement();
+            else
+                registerAdvertisement();
+        }
+
+        // Only the current full-client lease holder may touch PhoneAPI state.
+        // Ownership itself may be changed by the BlueZ event-loop thread, but
+        // all core processing below remains on this cooperative firmware thread.
+        if (!meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::BLUETOOTH,
+                                                                 this))
+            return INT32_MAX;
 
         // Writes before reads: clients send a ToRadio write and immediately read
         // the response, so the parked read must observe the write's effect.
@@ -374,6 +398,9 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
 
     void onToRadioWrite(std::vector<uint8_t> value, const PropertyMap &options)
     {
+        if (!meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::BLUETOOTH,
+                                                                 this))
+            throw sdbuscompat::dbusError("org.bluez.Error.NotPermitted", "BLE does not own the PhoneAPI lease");
         if (offsetOption(options) != 0)
             throw sdbuscompat::dbusError("org.bluez.Error.NotSupported", "offset writes not supported");
         if (value.empty() || value.size() > MAX_TO_FROM_RADIO_SIZE)
@@ -401,6 +428,11 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
 
     void onFromRadioRead(sdbus::Result<std::vector<uint8_t>> &&result, const PropertyMap &options)
     {
+        if (!meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::BLUETOOTH,
+                                                                 this)) {
+            result.returnError(sdbuscompat::dbusError("org.bluez.Error.NotPermitted", "BLE does not own the PhoneAPI lease"));
+            return;
+        }
         uint16_t offset = offsetOption(options);
 
         if (draining) {
@@ -512,7 +544,12 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         LOG_INFO("BLE %s %s", connected ? "connect" : "disconnect", path.c_str());
 
         if (connected) {
+            // Thread-safe state only. A TCP PhoneAPI observes the preemption and
+            // closes itself from the cooperative firmware thread.
+            meshtastic::portduino::fullPhoneApiLease().acquireBluetooth(this);
+            advertisingUpdatePending = true;
             publishStatus(meshtastic::BluetoothStatus::ConnectionState::CONNECTED);
+            wakeMainLoop();
         } else {
             // The peer left mid-pairing; the code on screen is dead either way.
             dismissPasskey();
@@ -521,6 +558,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 lastToRadioLen = 0; // event-loop thread owns this buffer
                 failParkedRead();
                 disconnectCleanupPending = true;
+                advertisingUpdatePending = true;
                 wakeMainLoop();
             }
         }
@@ -548,7 +586,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             connectedNow = prop->second.get<bool>();
         trackDevice(path, connectedNow);
         if (connectedNow)
-            publishStatus(meshtastic::BluetoothStatus::ConnectionState::CONNECTED);
+            onDeviceConnectedChanged(path, true);
     }
 
     void onInterfacesRemoved(const sdbus::ObjectPath &path, const std::vector<std::string> &interfaces)
@@ -647,6 +685,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 if (prop != dev->second.end())
                     connectedNow = prop->second.get<bool>();
                 trackDevice(entry.first, connectedNow);
+                if (connectedNow)
+                    onDeviceConnectedChanged(entry.first, true);
             }
 
             enabled = true;
@@ -814,7 +854,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
 
     void registerAdvertisement()
     {
-        if (!enabled || advertising)
+        if (!enabled || advertising || fullClientSuspended || checkIsConnected() ||
+            meshtastic::portduino::fullPhoneApiLease().owner() != meshtastic::portduino::FullPhoneApiLease::Owner::NONE)
             return;
         advertising = true;
         // Async for the same reason as RegisterApplication: bluetoothd reads our
@@ -847,6 +888,17 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         LOG_INFO("BLE advertising stopped");
     }
 
+    void setFullClientSuspended(bool suspended)
+    {
+        if (fullClientSuspended == suspended)
+            return;
+        fullClientSuspended = suspended;
+        if (suspended)
+            unregisterAdvertisement();
+        else
+            registerAdvertisement();
+    }
+
     void doDeinit()
     {
         if (!conn)
@@ -857,6 +909,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         passkeyHidePending = true;
         updatePasskeyAlert();
         failParkedRead();
+        close();
         unregisterAdvertisement();
         if (agentRegistered.exchange(false)) {
             try {
@@ -875,6 +928,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             }
         }
         enabled = false;
+        meshtastic::portduino::fullPhoneApiLease().release(meshtastic::portduino::FullPhoneApiLease::Owner::BLUETOOTH, this);
         teardownBus();
         publishStatus(meshtastic::BluetoothStatus::ConnectionState::DISCONNECTED);
         LOG_INFO("BLE disabled");
@@ -908,6 +962,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         draining = false;
         enabled = false;
         advertising = false;
+        advertisingUpdatePending = false;
         agentRegistered = false;
         appRegistered = false;
     }
@@ -977,6 +1032,11 @@ void LinuxBluetooth::shutdown()
 void LinuxBluetooth::resumeAdvertising()
 {
     impl->registerAdvertisement();
+}
+
+void LinuxBluetooth::setFullClientSuspended(bool suspended)
+{
+    impl->setFullClientSuspended(suspended);
 }
 
 void LinuxBluetooth::deinit()

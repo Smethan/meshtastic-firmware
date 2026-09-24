@@ -44,6 +44,10 @@ class LinuxBluetooth
     void shutdown();
     /// Re-register the advertisement after shutdown().
     void resumeAdvertising();
+    /// Suspend advertising while the unrestricted TCP PhoneAPI owns the
+    /// process-wide full-client lease. Called only by the cooperative firmware
+    /// thread; a connected BLE phone remains connected.
+    void setFullClientSuspended(bool suspended);
     /// Full teardown: unregister everything and drop the bus connection.
     void deinit();
 

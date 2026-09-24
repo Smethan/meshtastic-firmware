@@ -4,6 +4,11 @@
 
 #include "ServerAPI.h"
 #include "Throttle.h"
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+#include "platform/portduino/FullPhoneApiLease.h"
+#include "platform/portduino/LinuxBluetooth.h"
+extern LinuxBluetooth *linuxBluetooth;
+#endif
 #include <Arduino.h>
 #include <cstdlib>
 #include <new>
@@ -14,10 +19,30 @@ template <typename T>
 ServerAPI<T>::ServerAPI(T &_client) : StreamAPI(&client), concurrency::OSThread("ServerAPI"), client(_client)
 {
     LOG_INFO("Incoming API connection");
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    ownsFullPhoneApiLease = meshtastic::portduino::fullPhoneApiLease().tryAcquireTcp(this);
+    if (!ownsFullPhoneApiLease) {
+        LOG_WARN("Reject TCP API connection while Bluetooth owns the full PhoneAPI lease");
+        client.stop();
+        enabled = false;
+        return;
+    }
+    if (linuxBluetooth)
+        linuxBluetooth->setFullClientSuspended(true);
+#endif
 }
 
 template <typename T> ServerAPI<T>::~ServerAPI()
 {
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    // APIServerPort can destroy a preempted client directly after
+    // checkIsConnected() reports the lost lease. Finish cooperative PhoneAPI
+    // cleanup before acknowledging the handoff to BLE.
+    if (ownsFullPhoneApiLease) {
+        StreamAPI::close();
+        releaseFullPhoneApiLease();
+    }
+#endif
     client.stop();
 }
 
@@ -25,17 +50,51 @@ template <typename T> void ServerAPI<T>::close()
 {
     client.stop(); // drop tcp connection
     StreamAPI::close();
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    releaseFullPhoneApiLease();
+#endif
 }
+
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+template <typename T> void ServerAPI<T>::releaseFullPhoneApiLease()
+{
+    if (!ownsFullPhoneApiLease)
+        return;
+
+    ownsFullPhoneApiLease = false;
+    meshtastic::portduino::fullPhoneApiLease().release(meshtastic::portduino::FullPhoneApiLease::Owner::TCP, this);
+    // Clear the transport-local suspension even after BLE preempted us. The
+    // BlueZ backend still suppresses advertising while its phone is connected,
+    // then restores it when that phone releases the lease.
+    if (linuxBluetooth)
+        linuxBluetooth->setFullClientSuspended(false);
+}
+#endif
 
 /// Check the current underlying physical link to see if the client is currently
 /// connected
 template <typename T> bool ServerAPI<T>::checkIsConnected()
 {
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    if (!ownsFullPhoneApiLease ||
+        !meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::TCP, this))
+        return false;
+#endif
     return client.connected();
 }
 
 template <typename T> bool ServerAPI<T>::canWriteFrame(size_t)
 {
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    if (!ownsFullPhoneApiLease ||
+        !meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::TCP, this)) {
+        canWrite = false;
+        enabled = false;
+        LOG_INFO("Bluetooth preempted TCP PhoneAPI, closing TCP client");
+        close();
+        return false;
+    }
+#endif
     // Only a dropped link is a reason to refuse a write up front. A full transmit
     // buffer (availableForWrite() == 0) is normal backpressure, not a dead socket,
     // so we must not close the connection on it. A genuinely failed write is
@@ -61,6 +120,15 @@ template <typename T> void ServerAPI<T>::onFrameWriteFailed(size_t frameLen, siz
 
 template <class T> int32_t ServerAPI<T>::runOnce()
 {
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
+    if (!ownsFullPhoneApiLease ||
+        !meshtastic::portduino::fullPhoneApiLease().isHeldBy(meshtastic::portduino::FullPhoneApiLease::Owner::TCP, this)) {
+        LOG_INFO("Bluetooth owns the full PhoneAPI lease, closing TCP client");
+        close();
+        enabled = false;
+        return 0;
+    }
+#endif
     if (client.connected()) {
         if (lastContactMsec > 0 && !Throttle::isWithinTimespanMs(lastContactMsec, TCP_IDLE_TIMEOUT_MS)) {
             LOG_WARN("TCP connection timeout, no data for %lu ms", (unsigned long)(millis() - lastContactMsec));
