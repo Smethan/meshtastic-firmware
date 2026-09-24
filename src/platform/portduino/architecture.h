@@ -40,12 +40,9 @@
 #define HAS_HUB75_NATIVE 1
 #endif
 
-// BLE peripheral support (BlueZ over D-Bus) on Linux turns on automatically
-// when the sdbus-c++ dev package is installed (wired up in
-// variants/native/portduino.ini). When absent, HAS_BLUETOOTH stays at
-// configuration.h's default of 0 and the whole backend compiles out. Runtime
-// activation additionally requires `Bluetooth: Enabled: true` in config.yaml.
+// BLE peripheral support is an explicit native-wdg feature. Ordinary native
+// builds stay headless even when sdbus-c++ is installed on the build host.
 // See src/platform/portduino/LinuxBluetooth.cpp.
-#if defined(PORTDUINO_LINUX_HARDWARE) && __has_include(<sdbus-c++/sdbus-c++.h>)
+#if defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
 #define HAS_BLUETOOTH 1
 #endif

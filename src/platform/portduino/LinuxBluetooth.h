@@ -4,12 +4,13 @@
 
 // BLE peripheral support for meshtasticd, implemented against BlueZ's D-Bus
 // GATT, advertising and agent APIs via sdbus-c++. Compiled only on Linux hosts
-// with the sdbus-c++ dev package present (same optional-dependency idiom as the
-// ulfius webserver); everywhere else this header is empty and HAS_BLUETOOTH
-// stays 0.
-#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && __has_include(<sdbus-c++/sdbus-c++.h>)
+// in the native-wdg build. Other Portduino targets stay unchanged even when
+// sdbus-c++ happens to be installed on the build host.
+#if defined(ARCH_PORTDUINO) && defined(PORTDUINO_LINUX_HARDWARE) && defined(PORTDUINO_BLUEZ) && defined(MESHTASTIC_LINUX_BLE)
 
-#define MESHTASTIC_LINUX_BLE 1
+#if !__has_include(<sdbus-c++/sdbus-c++.h>)
+#error "native-wdg requires the sdbus-c++ development headers"
+#endif
 
 #include <cstddef>
 #include <cstdint>
