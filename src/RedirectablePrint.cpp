@@ -246,7 +246,7 @@ void RedirectablePrint::log_to_ble(const char *logLevel, const char *format, va_
             logRecord.level = getLogLevel(logLevel);
             vsnprintf(logRecord.message, sizeof(logRecord.message), format, arg);
             if (thread)
-                strlcpy(logRecord.source, thread->ThreadName.c_str(), sizeof(logRecord.source));
+                snprintf(logRecord.source, sizeof(logRecord.source), "%s", thread->ThreadName.c_str());
             logRecord.time = getValidTime(RTCQuality::RTCQualityDevice, true);
 
             auto buffer = std::unique_ptr<uint8_t[]>(new uint8_t[meshtastic_LogRecord_size]);
