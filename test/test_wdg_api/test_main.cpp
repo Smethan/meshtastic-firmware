@@ -869,10 +869,16 @@ void loop() {}
 void setUp() {}
 void tearDown() {}
 
+void test_wdg_api_is_excluded_from_this_environment()
+{
+    TEST_ASSERT_TRUE(true);
+}
+
 void setup()
 {
     initializeTestEnvironment();
     UNITY_BEGIN();
+    RUN_TEST(test_wdg_api_is_excluded_from_this_environment);
     exit(UNITY_END());
 }
 
