@@ -24,6 +24,13 @@ class NodeInfoModule : public ProtobufModule<meshtastic_User>, private concurren
     void sendOurNodeInfo(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = false, uint8_t channel = 0,
                          bool _shorterTimeout = false);
 
+#ifdef MESHTASTIC_WDG_API
+    /// Send NodeInfo without allowing the packet to be routed beyond direct
+    /// neighbors.
+    ErrorCode sendOurNodeInfoZeroHop(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = true, uint8_t channel = 0,
+                                     bool _shorterTimeout = true);
+#endif
+
     /**
      * Schedule an immediate NodeInfo periodic check.
      * Used when external conditions change (for example time source quality).
@@ -48,6 +55,10 @@ class NodeInfoModule : public ProtobufModule<meshtastic_User>, private concurren
     virtual int32_t runOnce() override;
 
   private:
+#ifdef MESHTASTIC_WDG_API
+    ErrorCode sendOurNodeInfoWithHopLimit(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout,
+                                          int16_t hopLimit);
+#endif
     bool shorterTimeout = false;
     bool suppressReplyForCurrentRequest = false;
     /// Sender -> uptime seconds (Time::getUptimeSecs()) at our last reply. Seconds, not millis:

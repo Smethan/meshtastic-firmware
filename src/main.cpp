@@ -121,6 +121,7 @@ LinuxBluetooth *linuxBluetooth = nullptr;
 #include "platform/portduino/PortduinoGlue.h"
 #if defined(MESHTASTIC_WDG_API) && defined(__linux__)
 #include "platform/portduino/WdgApi.h"
+#include "platform/portduino/WdgPolicy.h"
 #endif
 #ifdef _WIN32
 #include "platform/portduino/windows/WindowsService.h"
@@ -1290,13 +1291,15 @@ void setup()
 #endif
 
 #if defined(MESHTASTIC_WDG_API) && defined(__linux__)
-    wdgApi = new meshtastic::portduino::WdgApi();
-    if (!wdgApi->start())
-        LOG_WARN("WDG API will retry after startup");
-    std::atexit([] {
-        delete wdgApi;
-        wdgApi = nullptr;
-    });
+    if (meshtastic::portduino::wdgPolicy().apiEnabled && meshtastic::portduino::wdgPolicy().valid) {
+        wdgApi = new meshtastic::portduino::WdgApi();
+        if (!wdgApi->start())
+            LOG_WARN("WDG API will retry after startup");
+        std::atexit([] {
+            delete wdgApi;
+            wdgApi = nullptr;
+        });
+    }
 #endif
 }
 

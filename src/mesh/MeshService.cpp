@@ -23,6 +23,10 @@
 #include "modules/NodeInfoModule.h"
 #include "modules/PositionModule.h"
 #include "modules/RoutingModule.h"
+#ifdef MESHTASTIC_WDG_API
+#include "Default.h"
+#include "Throttle.h"
+#endif
 #include <assert.h>
 #include <string>
 
@@ -78,6 +82,18 @@ MeshService::MeshService()
     lastQueueStatus = {0, 0, 16, 0};
 }
 
+#ifdef MESHTASTIC_WDG_API
+bool MeshService::tryReserveTextMessageSend()
+{
+    std::lock_guard<std::mutex> guard(clientTextMessageLock);
+    if (clientTextMessageSent && Throttle::isWithinTimespanMs(lastClientTextMessageMs, TWO_SECONDS_MS))
+        return false;
+    lastClientTextMessageMs = Time::getMillis();
+    clientTextMessageSent = true;
+    return true;
+}
+#endif
+
 void MeshService::init()
 {
 #if HAS_GPS
@@ -121,6 +137,13 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
         LOG_DEBUG("Skip phone echo of our own packet 0x%08x", mp->id);
         return 0;
     }
+
+#ifdef MESHTASTIC_WDG_API
+    // This is the narrow accepted-ingress boundary: Router/RoutingModule has
+    // already admitted the remote packet, and our own radio echo was removed
+    // above. Observe it independently of toPhoneQueue allocation or consumers.
+    wdgRemotePacketAccepted.notifyObservers(mp);
+#endif
 
     printPacket("Forwarding to phone", mp);
     if (auto *toPhone = packetPool.allocCopy(*mp))
@@ -370,6 +393,13 @@ ErrorCode MeshService::sendQueueStatusToPhone(const meshtastic_QueueStatus &qs, 
 
 void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
 {
+#ifdef MESHTASTIC_WDG_API
+    (void)sendToMeshWithResult(p, src, ccToPhone);
+}
+
+ErrorCode MeshService::sendToMeshWithResult(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
+{
+#endif
     uint32_t mesh_packet_id = p->id;
     nodeDB->updateFrom(*p); // update our local DB for this packet (because phone might have sent position packets etc...)
 
@@ -404,6 +434,9 @@ void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPh
     if (res == ERRNO_SHOULD_RELEASE) {
         releaseToPool(p);
     }
+#ifdef MESHTASTIC_WDG_API
+    return res;
+#endif
 }
 
 bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)

@@ -3514,6 +3514,9 @@ void NodeDB::updatePosition(uint32_t nodeId, const meshtastic_Position &p, RxSou
     updateGUIforNode = info;
     notifyObservers(true); // Force an update whether or not our node counts have changed
 #endif
+#ifdef MESHTASTIC_WDG_API
+    wdgNodeChanged.notifyObservers(nodeId);
+#endif
 }
 
 /** Update telemetry info for this node based on received metrics. Stores
@@ -3556,6 +3559,9 @@ void NodeDB::updateTelemetry(uint32_t nodeId, const meshtastic_Telemetry &t, RxS
     }
     updateGUIforNode = info;
     notifyObservers(true);
+#ifdef MESHTASTIC_WDG_API
+    wdgNodeChanged.notifyObservers(nodeId);
+#endif
 }
 
 /**
@@ -3717,6 +3723,9 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
     if (changed) {
         updateGUIforNode = info;
         notifyObservers(true); // Force an update whether or not our node counts have changed
+#ifdef MESHTASTIC_WDG_API
+        wdgNodeChanged.notifyObservers(nodeId);
+#endif
 
         // We just changed something about a User,
         // store our DB unless we just did so less than a minute ago
@@ -3826,6 +3835,9 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
             info->hops_away = hopsAway;
         }
         sortMeshDB();
+#ifdef MESHTASTIC_WDG_API
+        wdgNodeChanged.notifyObservers(getFrom(&mp));
+#endif
     }
 }
 

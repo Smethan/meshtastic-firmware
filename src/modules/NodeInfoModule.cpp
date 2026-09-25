@@ -97,6 +97,9 @@ void NodeInfoModule::alterReceivedProtobuf(meshtastic_MeshPacket &mp, meshtastic
 
 void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout)
 {
+#ifdef MESHTASTIC_WDG_API
+    (void)sendOurNodeInfoWithHopLimit(dest, wantReplies, channel, _shorterTimeout, -1);
+#else
     // cancel any not yet sent (now stale) position packets
     if (prevPacketId) // if we wrap around to zero, we'll simply fail to cancel in that rare case (no big deal)
         service->cancelSending(prevPacketId);
@@ -126,7 +129,47 @@ void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t cha
         service->sendToMesh(p);
         shorterTimeout = false;
     }
+#endif
 }
+
+#ifdef MESHTASTIC_WDG_API
+ErrorCode NodeInfoModule::sendOurNodeInfoZeroHop(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout)
+{
+    return sendOurNodeInfoWithHopLimit(dest, wantReplies, channel, _shorterTimeout, 0);
+}
+
+ErrorCode NodeInfoModule::sendOurNodeInfoWithHopLimit(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout,
+                                                      int16_t hopLimit)
+{
+    if (prevPacketId)
+        service->cancelSending(prevPacketId);
+    shorterTimeout = _shorterTimeout;
+    DEBUG_HEAP_BEFORE;
+    meshtastic_MeshPacket *p = allocReply();
+    DEBUG_HEAP_AFTER("NodeInfoModule::sendOurNodeInfo", p);
+    if (!p) {
+        shorterTimeout = false;
+        return ERRNO_UNKNOWN;
+    }
+
+    p->to = dest;
+    p->decoded.want_response = (config.device.role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
+                                config.device.role != meshtastic_Config_DeviceConfig_Role_SENSOR) &&
+                               wantReplies;
+    p->priority = _shorterTimeout ? meshtastic_MeshPacket_Priority_DEFAULT : meshtastic_MeshPacket_Priority_BACKGROUND;
+    if (channel > 0) {
+        LOG_DEBUG("Send ourNodeInfo to channel %d", channel);
+        p->channel = channel;
+    }
+    if (hopLimit >= 0)
+        p->hop_limit = static_cast<uint8_t>(std::min<int16_t>(hopLimit, HOP_MAX));
+
+    prevPacketId = p->id;
+    const ErrorCode result = service->sendToMeshWithResult(p);
+    shorterTimeout = false;
+    return result;
+}
+#endif
 
 void NodeInfoModule::triggerImmediateNodeInfoCheck()
 {

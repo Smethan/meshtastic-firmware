@@ -40,6 +40,9 @@
 #include "mesh/NodeDB.h"               // config.bluetooth.enabled
 extern LinuxBluetooth *linuxBluetooth; // defined in main.cpp
 #endif
+#ifdef MESHTASTIC_WDG_API
+#include "platform/portduino/WdgPolicy.h"
+#endif
 
 #ifdef PORTDUINO_LINUX_HARDWARE
 #include <cxxabi.h>
@@ -95,6 +98,14 @@ void setBluetoothEnable(bool enable)
         }
         return;
     }
+#ifdef MESHTASTIC_WDG_API
+    if (!meshtastic::portduino::wdgBluetoothAllowed())
+        return;
+    // Re-resolve the stable controller address every time BLE is enabled. A
+    // USB adapter may have appeared after startup or returned under a different
+    // hciX number. LinuxBluetooth also repeats this during recovery.
+    meshtastic::portduino::refreshWdgBluetoothAdapter();
+#endif
     // Opt-in twice: the config.yaml Bluetooth section must enable BLE on this
     // host, and the regular device config (like every other platform) must have
     // Bluetooth on.
@@ -121,7 +132,15 @@ void cpuDeepSleep(uint32_t msecs)
     notImplemented("cpuDeepSleep");
 }
 
-void updateBatteryLevel(uint8_t level) NOT_IMPLEMENTED("updateBatteryLevel");
+void updateBatteryLevel(uint8_t level)
+{
+#ifdef MESHTASTIC_LINUX_BLE
+    if (linuxBluetooth)
+        linuxBluetooth->updateBatteryLevel(level);
+#else
+    (void)level;
+#endif
+}
 
 int TCPPort = SERVER_API_DEFAULT_PORT;
 bool checkConfigPort = true;
@@ -384,9 +403,17 @@ void portduinoSetup()
     return;
 #endif
 
-    if (portduino_config.force_simradio == true) {
+#ifdef MESHTASTIC_WDG_API
+    // native-wdg validation needs the non-radio settings in an explicit config
+    // even when -s selects SimRadio.
+    if (configPath != nullptr) {
+#else
+    // Preserve upstream Portduino precedence: ordinary native -s skips all
+    // host configuration discovery.
+    if (portduino_config.force_simradio) {
         portduino_config.lora_module = use_simradio;
     } else if (configPath != nullptr) {
+#endif
         if (loadConfig(configPath)) {
             if (!yamlOnly && !configCheck)
                 std::cout << "Using " << configPath << " as config file" << std::endl;
@@ -396,6 +423,10 @@ void portduinoSetup()
             std::cout << "Unable to use " << configPath << " as config file" << std::endl;
             exit(EXIT_FAILURE);
         }
+#ifdef MESHTASTIC_WDG_API
+    } else if (portduino_config.force_simradio) {
+        // A bare -s still skips host config discovery.
+#endif
     } else if (access("config.yaml", R_OK) == 0) {
         if (loadConfig("config.yaml")) {
             if (!yamlOnly && !configCheck)
@@ -443,6 +474,13 @@ void portduinoSetup()
         }
     }
 
+#ifdef MESHTASTIC_WDG_API
+    // ConfigDirectory fragments may also select a radio. In native-wdg, -s
+    // always wins after every explicit config source has been parsed.
+    if (portduino_config.force_simradio)
+        portduino_config.lora_module = use_simradio;
+#endif
+
 #ifndef ARCH_PORTDUINO_WASM
     // --check wins over --output-yaml: asking for validation and getting a config dump
     // with no report at all would be the more surprising of the two outcomes.
@@ -453,6 +491,12 @@ void portduinoSetup()
         std::cout << portduino_config.emit_yaml() << std::endl;
         exit(EXIT_SUCCESS);
     }
+#endif
+
+#ifdef MESHTASTIC_WDG_API
+    // Apply the root-owned host policy after all regular YAML fragments, but
+    // before identity selection, Bluetooth setup, or the simulated dry run.
+    meshtastic::portduino::loadWdgPolicyFromEnvironment();
 #endif
 
     if (portduino_config.force_simradio) {

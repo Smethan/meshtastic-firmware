@@ -9,6 +9,9 @@
 #include "MeshRadio.h"
 #include "MeshTypes.h"
 #include "Observer.h"
+#ifdef MESHTASTIC_WDG_API
+#include <mutex>
+#endif
 #ifdef ARCH_PORTDUINO
 #include "PointerQueue.h"
 #else
@@ -187,6 +190,20 @@ class MeshService
     /// cache
     void sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
 
+#ifdef MESHTASTIC_WDG_API
+    /// Reserve the shared two-second client text-send window.
+    bool tryReserveTextMessageSend();
+
+    /// Accepted remote mesh packets, before any PhoneAPI queue copy. Restricted
+    /// local integrations use this for transport diagnostics without consuming
+    /// the destructive phone queue.
+    Observable<const meshtastic_MeshPacket *> wdgRemotePacketAccepted;
+
+    /// Restricted local integrations need the immediate enqueue result without
+    /// bypassing normal send handling.
+    ErrorCode sendToMeshWithResult(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
+#endif
+
     /** Attempt to cancel a previously sent packet from this _local_ node.  Returns true if a packet was found we could cancel */
     bool cancelSending(PacketId id);
 
@@ -213,6 +230,11 @@ class MeshService
     uint32_t GetTimeSinceMeshPacket(const meshtastic_MeshPacket *mp);
 
   private:
+#ifdef MESHTASTIC_WDG_API
+    std::mutex clientTextMessageLock;
+    uint32_t lastClientTextMessageMs = 0;
+    bool clientTextMessageSent = false;
+#endif
 #if HAS_GPS
     /// Called when our gps position has changed - updates nodedb and sends Location message out into the mesh
     /// returns 0 to allow further processing
