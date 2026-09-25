@@ -57,6 +57,11 @@ jobs:
 
   native:
     if: github.event_name != 'workflow_dispatch' || inputs.operation != 'publish_draft'
+    name: native (${{ matrix.environment }})
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [native, native-wdg]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -78,19 +83,23 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ~/.platformio/.cache
-          key: wdg-native-${{ runner.os }}-${{ hashFiles('platformio.ini', 'variants/native/**/*.ini') }}
-          restore-keys: wdg-native-${{ runner.os }}-
-      - name: Build ordinary native
-        run: pio run -e native
-      - name: Build WDG native
-        run: pio run -e native-wdg
+          key: wdg-${{ matrix.environment }}-${{ runner.os }}-${{ hashFiles('platformio.ini', 'variants/native/**/*.ini') }}
+          restore-keys: |
+            wdg-${{ matrix.environment }}-${{ runner.os }}-
+            wdg-native-${{ runner.os }}-
+      - name: Build ${{ matrix.environment }}
+        run: pio run -e ${{ matrix.environment }}
       - name: Validate simulated candidate config loading
+        if: matrix.environment == 'native-wdg'
         run: ./bin/test-sim-config.sh .pio/build/native-wdg/meshtasticd
       - name: Config validation
+        if: matrix.environment == 'native-wdg'
         run: ./bin/test-config-check.sh .pio/build/native-wdg/meshtasticd
       - name: Complete native tests
+        if: matrix.environment == 'native'
         run: ./bin/run-tests.sh
       - name: Complete WDG native tests
+        if: matrix.environment == 'native-wdg'
         run: ./bin/run-tests.sh -e native-wdg
 
   package-arm64:
