@@ -7,21 +7,22 @@ set -euo pipefail
 umask 022
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-TAG=${1:-${GITHUB_REF_NAME:-}}
+TAG=${1:-${GITHUB_REF_NAME-}}
 BINARY=${2:-"$ROOT/.pio/build/native-wdg/meshtasticd"}
 OUT_DIR=${3:-"$ROOT/dist"}
 
 if [[ ! $TAG =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-wdg\.([0-9]+)$ ]]; then
-    echo "release tag must match vMAJOR.MINOR.PATCH-wdg.N" >&2
-    exit 2
+	echo "release tag must match vMAJOR.MINOR.PATCH-wdg.N" >&2
+	exit 2
 fi
 if [[ ! -f $BINARY || ! -x $BINARY ]]; then
-    echo "native-wdg binary is missing or not executable: $BINARY" >&2
-    exit 2
+	echo "native-wdg binary is missing or not executable: $BINARY" >&2
+	exit 2
 fi
-if [[ $(dpkg --print-architecture) != arm64 ]]; then
-    echo "WDG release packages must be built natively for arm64" >&2
-    exit 2
+BUILD_ARCHITECTURE=$(dpkg --print-architecture)
+if [[ $BUILD_ARCHITECTURE != arm64 ]]; then
+	echo "WDG release packages must be built natively for arm64" >&2
+	exit 2
 fi
 
 PACKAGE_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}+wdg${BASH_REMATCH[4]}"
@@ -37,53 +38,53 @@ SOURCE_REF=${MESHTASTIC_SOURCE_REF:-$TAG}
 [[ $UPSTREAM_COMMIT =~ ^[0-9a-f]{40}$ ]]
 [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
 
-MAX_GLIBC=$(readelf --version-info "$BINARY" \
-    | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
-    | sort -V | tail -n 1)
+MAX_GLIBC=$(readelf --version-info "$BINARY" |
+	sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' |
+	sort -V | tail -n 1)
 if [[ -z $MAX_GLIBC ]] || ! dpkg --compare-versions "$MAX_GLIBC" le 2.36; then
-    echo "binary requires glibc ${MAX_GLIBC:-unknown}; Bookworm limit is 2.36" >&2
-    exit 2
+	echo "binary requires glibc ${MAX_GLIBC:-unknown}; Bookworm limit is 2.36" >&2
+	exit 2
 fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 STAGE="$WORK/stage"
 mkdir -p \
-    "$STAGE/DEBIAN" \
-    "$STAGE/usr/lib/meshtasticd-wdg" \
-    "$STAGE/usr/lib/systemd/system" \
-    "$STAGE/usr/lib/tmpfiles.d" \
-    "$STAGE/usr/lib/sysusers.d" \
-    "$STAGE/usr/share/dbus-1/system.d" \
-    "$STAGE/usr/share/meshtasticd-wdg" \
-    "$STAGE/usr/share/doc/meshtasticd-wdg"
+	"$STAGE/DEBIAN" \
+	"$STAGE/usr/lib/meshtasticd-wdg" \
+	"$STAGE/usr/lib/systemd/system" \
+	"$STAGE/usr/lib/tmpfiles.d" \
+	"$STAGE/usr/lib/sysusers.d" \
+	"$STAGE/usr/share/dbus-1/system.d" \
+	"$STAGE/usr/share/meshtasticd-wdg" \
+	"$STAGE/usr/share/doc/meshtasticd-wdg"
 
 install -m 0755 "$BINARY" "$STAGE/usr/lib/meshtasticd-wdg/meshtasticd"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.service" \
-    "$STAGE/usr/lib/systemd/system/meshtasticd-wdg.service"
+	"$STAGE/usr/lib/systemd/system/meshtasticd-wdg.service"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.tmpfiles" \
-    "$STAGE/usr/lib/tmpfiles.d/meshtasticd-wdg.conf"
+	"$STAGE/usr/lib/tmpfiles.d/meshtasticd-wdg.conf"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.sysusers" \
-    "$STAGE/usr/lib/sysusers.d/meshtasticd-wdg.conf"
+	"$STAGE/usr/lib/sysusers.d/meshtasticd-wdg.conf"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg-dbus.conf" \
-    "$STAGE/usr/share/dbus-1/system.d/meshtasticd-wdg.conf"
+	"$STAGE/usr/share/dbus-1/system.d/meshtasticd-wdg.conf"
 install -m 0644 "$ROOT/packaging/wdg/wdg-portduino.example.yaml" \
-    "$STAGE/usr/share/meshtasticd-wdg/wdg-portduino.example.yaml"
+	"$STAGE/usr/share/meshtasticd-wdg/wdg-portduino.example.yaml"
 install -m 0644 "$ROOT/packaging/wdg/copyright" \
-    "$STAGE/usr/share/doc/meshtasticd-wdg/copyright"
+	"$STAGE/usr/share/doc/meshtasticd-wdg/copyright"
 install -m 0644 "$ROOT/UPSTREAM_BASE" \
-    "$STAGE/usr/share/doc/meshtasticd-wdg/UPSTREAM_BASE"
+	"$STAGE/usr/share/doc/meshtasticd-wdg/UPSTREAM_BASE"
 install -m 0755 "$ROOT/packaging/wdg/postinst" "$STAGE/DEBIAN/postinst"
 
-SHLIBS=$(dpkg-shlibdeps -O -e"$BINARY" 2>"$WORK/shlib-errors" \
-    | sed -n 's/^shlibs:Depends=//p') || {
-    cat "$WORK/shlib-errors" >&2
-    exit 2
+SHLIBS=$(dpkg-shlibdeps -O -e"$BINARY" 2>"$WORK/shlib-errors" |
+	sed -n 's/^shlibs:Depends=//p') || {
+	cat "$WORK/shlib-errors" >&2
+	exit 2
 }
 if [[ -z $SHLIBS ]]; then
-    echo "dpkg-shlibdeps did not report runtime dependencies" >&2
-    cat "$WORK/shlib-errors" >&2
-    exit 2
+	echo "dpkg-shlibdeps did not report runtime dependencies" >&2
+	cat "$WORK/shlib-errors" >&2
+	exit 2
 fi
 
 python3 - "$SHLIBS" <<'PY'
@@ -130,7 +131,7 @@ Description: Meshtastic daemon with WatchDogsGo local API and BlueZ phone transp
 EOF
 
 python3 - "$TAG" "$PACKAGE_VERSION" "$ASSET" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "$SOURCE_COMMIT" "$SOURCE_REF" \
-    >"$STAGE/usr/share/doc/meshtasticd-wdg/compatibility.json" <<'PY'
+	>"$STAGE/usr/share/doc/meshtasticd-wdg/compatibility.json" <<'PY'
 import json, sys
 tag, version, asset, upstream_tag, upstream_commit, source_commit, source_ref = sys.argv[1:]
 print(json.dumps({
@@ -162,8 +163,8 @@ dpkg-deb --root-owner-group --build "$STAGE" "$OUT_DIR/$ASSET"
 SIZE=$(stat -c %s "$OUT_DIR/$ASSET")
 SHA256=$(sha256sum "$OUT_DIR/$ASSET" | awk '{print $1}')
 python3 - "$TAG" "$PACKAGE_VERSION" "$ASSET" "$SIZE" "$SHA256" \
-    "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "$MAX_GLIBC" "$SOURCE_COMMIT" "$SOURCE_REF" \
-    >"$OUT_DIR/compatibility.json" <<'PY'
+	"$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "$MAX_GLIBC" "$SOURCE_COMMIT" "$SOURCE_REF" \
+	>"$OUT_DIR/compatibility.json" <<'PY'
 import json, sys
 tag, version, asset, size, sha256, upstream_tag, upstream_commit, glibc, source_commit, source_ref = sys.argv[1:]
 print(json.dumps({
@@ -192,11 +193,11 @@ print(json.dumps({
 PY
 
 if [[ $SOURCE_REF == "$TAG" ]]; then
-    SOURCE_ARCHIVE_ZIP="https://github.com/Smethan/meshtastic-firmware/archive/refs/tags/$TAG.zip"
-    SOURCE_ARCHIVE_TGZ="https://github.com/Smethan/meshtastic-firmware/archive/refs/tags/$TAG.tar.gz"
+	SOURCE_ARCHIVE_ZIP="https://github.com/Smethan/meshtastic-firmware/archive/refs/tags/$TAG.zip"
+	SOURCE_ARCHIVE_TGZ="https://github.com/Smethan/meshtastic-firmware/archive/refs/tags/$TAG.tar.gz"
 else
-    SOURCE_ARCHIVE_ZIP="https://github.com/Smethan/meshtastic-firmware/archive/$SOURCE_COMMIT.zip"
-    SOURCE_ARCHIVE_TGZ="https://github.com/Smethan/meshtastic-firmware/archive/$SOURCE_COMMIT.tar.gz"
+	SOURCE_ARCHIVE_ZIP="https://github.com/Smethan/meshtastic-firmware/archive/$SOURCE_COMMIT.zip"
+	SOURCE_ARCHIVE_TGZ="https://github.com/Smethan/meshtastic-firmware/archive/$SOURCE_COMMIT.tar.gz"
 fi
 
 cat >"$OUT_DIR/SOURCE.txt" <<EOF
@@ -217,8 +218,8 @@ EOF
 install -m 0644 "$ROOT/packaging/wdg/copyright" "$OUT_DIR/copyright"
 
 (
-    cd "$OUT_DIR"
-    sha256sum "$ASSET" compatibility.json SOURCE.txt copyright >SHA256SUMS
+	cd "$OUT_DIR"
+	sha256sum "$ASSET" compatibility.json SOURCE.txt copyright >SHA256SUMS
 )
 
 dpkg-deb --info "$OUT_DIR/$ASSET"

@@ -123,7 +123,6 @@ lint:
     - linters: [ALL]
       paths:
         - bin/**
-        - .github/**
     # Fake-NodeDB fixture JSONL files contain deterministic synthetic
     # public_key_hex (64-char hex) values that gitleaks misidentifies as
     # generic-api-key. These are not secrets - they're test fixtures
@@ -162,6 +161,13 @@ lint:
         - test/test_airtime/test_main.cpp
         - test/test_throttle/test_main.cpp
         - test/test_uptime_clock/test_main.cpp
+    # These host-only tests use long deterministic test identifiers and
+    # synthetic payloads that TruffleHog's Lob detector misclassifies. They
+    # contain no credentials and are compiled test source, not runtime config.
+    - linters: [trufflehog]
+      paths:
+        - test/test_full_phone_api_lease/test_main.cpp
+        - test/test_wdg_api/test_main.cpp
 runtimes:
   enabled:
     - python@3.14.4

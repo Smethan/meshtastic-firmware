@@ -28,48 +28,48 @@ TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 DEB=meshtasticd-wdg_2.8.0+wdg1_arm64.deb
 for directory in draft tested; do
-    mkdir "$TEST_ROOT/$directory"
-    printf 'package\n' >"$TEST_ROOT/$directory/$DEB"
-    printf 'source\n' >"$TEST_ROOT/$directory/SOURCE.txt"
-    printf '{}\n' >"$TEST_ROOT/$directory/compatibility.json"
-    printf 'GPL-3.0-only\n' >"$TEST_ROOT/$directory/copyright"
-    (
-        cd "$TEST_ROOT/$directory"
-        sha256sum "$DEB" compatibility.json SOURCE.txt copyright >SHA256SUMS
-    )
+	mkdir "$TEST_ROOT/$directory"
+	printf 'package\n' >"$TEST_ROOT/$directory/$DEB"
+	printf 'source\n' >"$TEST_ROOT/$directory/SOURCE.txt"
+	printf '{}\n' >"$TEST_ROOT/$directory/compatibility.json"
+	printf 'GPL-3.0-only\n' >"$TEST_ROOT/$directory/copyright"
+	(
+		cd "$TEST_ROOT/$directory"
+		sha256sum "$DEB" compatibility.json SOURCE.txt copyright >SHA256SUMS
+	)
 done
 "$VERIFY_ASSETS" "$TEST_ROOT/draft" "$TEST_ROOT/tested" "$DEB"
 
 # A mutable draft checksum must be rejected before it is interpreted.
 printf 'tampered\n' >"$TEST_ROOT/draft/SHA256SUMS"
 if "$VERIFY_ASSETS" "$TEST_ROOT/draft" "$TEST_ROOT/tested" "$DEB" \
-        >/dev/null 2>&1; then
-    echo "tested asset verifier accepted a mutable draft checksum" >&2
-    exit 1
+	>/dev/null 2>&1; then
+	echo "tested asset verifier accepted a mutable draft checksum" >&2
+	exit 1
 fi
 cp "$TEST_ROOT/tested/SHA256SUMS" "$TEST_ROOT/draft/SHA256SUMS"
 
 # Non-regular and nested entries are never part of the five-file artifact.
 mkfifo "$TEST_ROOT/draft/unexpected-fifo"
 if "$VERIFY_ASSETS" "$TEST_ROOT/draft" "$TEST_ROOT/tested" "$DEB" \
-        >/dev/null 2>&1; then
-    echo "tested asset verifier accepted an extra FIFO" >&2
-    exit 1
+	>/dev/null 2>&1; then
+	echo "tested asset verifier accepted an extra FIFO" >&2
+	exit 1
 fi
 
 if grep -Eq '(systemctl|service)[[:space:]]+(start|enable|disable|stop)' "$POSTINST"; then
-    echo "package maintainer script must not change service state" >&2
-    exit 1
+	echo "package maintainer script must not change service state" >&2
+	exit 1
 fi
 if grep -Eq '(^|/)usr/bin/meshtasticd([^A-Za-z0-9_-]|$)' "$BUILD"; then
-    echo "package script contains the stock binary path" >&2
-    exit 1
+	echo "package script contains the stock binary path" >&2
+	exit 1
 fi
 if rg -n --glob '!test-package.sh' \
-    'Smethan/firmware([^A-Za-z0-9_-]|$)' \
-    "$ROOT/packaging" "$ROOT/UPSTREAM_BASE"; then
-    echo "generic Smethan/firmware repository reference found" >&2
-    exit 1
+	'Smethan/firmware([^A-Za-z0-9_-]|$)' \
+	"$ROOT/packaging" "$ROOT/UPSTREAM_BASE"; then
+	echo "generic Smethan/firmware repository reference found" >&2
+	exit 1
 fi
 
 echo "WDG package policy checks passed"

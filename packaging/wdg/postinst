@@ -1,29 +1,29 @@
 #!/bin/sh
 set -e
 
-case "${1:-}" in
-  configure|reconfigure)
-    if command -v systemd-sysusers >/dev/null 2>&1; then
-      systemd-sysusers /usr/lib/sysusers.d/meshtasticd-wdg.conf
-    fi
-    if command -v systemd-tmpfiles >/dev/null 2>&1; then
-      systemd-tmpfiles --create /usr/lib/tmpfiles.d/meshtasticd-wdg.conf
-    fi
-    policy=/etc/meshtasticd/wdg-portduino.yaml
-    if [ -e "$policy" ] || [ -L "$policy" ]; then
-      if [ ! -f "$policy" ] || [ -L "$policy" ]; then
-        echo "Unsafe Meshtastic WDG policy: $policy" >&2
-        exit 1
-      fi
-      chown root:meshtasticd "$policy"
-      chmod 0640 "$policy"
-    fi
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-    ;;
-  abort-upgrade|abort-remove|abort-deconfigure)
-    ;;
+case "${1-}" in
+configure | reconfigure)
+	if command -v systemd-sysusers >/dev/null 2>&1; then
+		systemd-sysusers /usr/lib/sysusers.d/meshtasticd-wdg.conf
+	fi
+	if command -v systemd-tmpfiles >/dev/null 2>&1; then
+		systemd-tmpfiles --create /usr/lib/tmpfiles.d/meshtasticd-wdg.conf
+	fi
+	policy=/etc/meshtasticd/wdg-portduino.yaml
+	if [ -e "$policy" ] || [ -L "$policy" ]; then
+		if [ ! -f "$policy" ] || [ -L "$policy" ]; then
+			echo "Unsafe Meshtastic WDG policy: $policy" >&2
+			exit 1
+		fi
+		chown root:meshtasticd "$policy"
+		chmod 0640 "$policy"
+	fi
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl daemon-reload >/dev/null 2>&1 || true
+	fi
+	;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*) ;;
 esac
 
 exit 0
