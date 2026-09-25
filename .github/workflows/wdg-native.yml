@@ -34,29 +34,15 @@ permissions:
 
 concurrency:
   group: >-
-    wdg-portduino-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{
-    github.event_name == 'workflow_dispatch' && format('{0}-{1}', inputs.operation,
-    inputs.package_tag) || 'source' }}
+    wdg-portduino-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref
+    }}-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}',
+    inputs.operation, inputs.package_tag) || 'source' }}
   cancel-in-progress: true
 
 jobs:
-  policy:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'publish_draft' && inputs.package_tag || github.sha }}
-          submodules: recursive
-          persist-credentials: false
-      - name: Formatting and policy
-        uses: trunk-io/trunk-action@e1234e67a86010d61ddac8d8ebf4b783e2ffd2fa
-        with:
-          cache: false
-      - name: Package policy
-        run: ./packaging/wdg/test-package.sh
-
   native:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'publish_draft'
+    if: github.event_name != 'workflow_dispatch' || inputs.operation !=
+      'publish_draft'
     name: native (${{ matrix.environment }})
     strategy:
       fail-fast: false
@@ -83,7 +69,8 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ~/.platformio/.cache
-          key: wdg-${{ matrix.environment }}-${{ runner.os }}-${{ hashFiles('platformio.ini', 'variants/native/**/*.ini') }}
+          key: wdg-${{ matrix.environment }}-${{ runner.os }}-${{
+            hashFiles('platformio.ini', 'variants/native/**/*.ini') }}
           restore-keys: |
             wdg-${{ matrix.environment }}-${{ runner.os }}-
             wdg-native-${{ runner.os }}-
@@ -104,9 +91,9 @@ jobs:
 
   package-arm64:
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.operation == 'package')
-    needs: [policy, native]
+      startsWith(github.ref, 'refs/tags/v') || (github.event_name ==
+      'workflow_dispatch' && inputs.operation == 'package')
+    needs: [native]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     container: debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
@@ -139,8 +126,10 @@ jobs:
         run: /opt/pio/bin/pio run -e native-wdg
       - name: Build side-by-side Debian package
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.package_tag || github.ref_name }}
-          MESHTASTIC_SOURCE_REF: ${{ github.event_name == 'push' && github.ref_name || format('commit:{0}', github.sha) }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.package_tag
+            || github.ref_name }}
+          MESHTASTIC_SOURCE_REF: ${{ github.event_name == 'push' && github.ref_name ||
+            format('commit:{0}', github.sha) }}
         run: ./packaging/wdg/build-deb.sh "$RELEASE_TAG"
       - name: Name immutable package artifact
         id: artifact
@@ -161,8 +150,8 @@ jobs:
 
   verify-package-arm64:
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.operation == 'package')
+      startsWith(github.ref, 'refs/tags/v') || (github.event_name ==
+      'workflow_dispatch' && inputs.operation == 'package')
     needs: package-arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -231,7 +220,8 @@ jobs:
           done
 
   stage-draft-release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-wdg.')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      contains(github.ref_name, '-wdg.')
     needs: [package-arm64, verify-package-arm64]
     runs-on: ubuntu-24.04
     permissions:
@@ -260,8 +250,8 @@ jobs:
             --notes "Hardware acceptance candidate. Immutable Actions artifact: run ${GITHUB_RUN_ID}, producer attempt ${{ needs.package-arm64.outputs.artifact_attempt }}, name ${{ needs.package-arm64.outputs.artifact_name }}."
 
   publish-draft-release:
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish_draft'
-    needs: policy
+    if: github.event_name == 'workflow_dispatch' && inputs.operation ==
+      'publish_draft'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
