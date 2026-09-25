@@ -269,16 +269,31 @@ jobs:
         run: |
           [[ $GITHUB_REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+-wdg\.[0-9]+$ ]]
           (cd dist && sha256sum --check SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" \
-            dist/meshtasticd-wdg_*_arm64.deb \
-            dist/compatibility.json \
-            dist/SHA256SUMS \
-            dist/SOURCE.txt \
-            dist/copyright \
+          notes="Hardware acceptance candidate. Immutable Actions artifact: run ${GITHUB_RUN_ID}, producer attempt ${{ needs.package-arm64.outputs.artifact_attempt }}, name ${{ needs.package-arm64.outputs.artifact_name }}."
+          assets=(
+            dist/meshtasticd-wdg_*_arm64.deb
+            dist/compatibility.json
+            dist/SHA256SUMS
+            dist/SOURCE.txt
+            dist/copyright
+          )
+          if gh release view "$GITHUB_REF_NAME" \
             --repo Smethan/meshtastic-firmware \
-            --verify-tag \
-            --draft \
-            --notes "Hardware acceptance candidate. Immutable Actions artifact: run ${GITHUB_RUN_ID}, producer attempt ${{ needs.package-arm64.outputs.artifact_attempt }}, name ${{ needs.package-arm64.outputs.artifact_name }}."
+            --json isDraft,isPrerelease,tagName > release.json 2>/dev/null; then
+            jq -e --arg tag "$GITHUB_REF_NAME" \
+              '.isDraft == true and .isPrerelease == false and .tagName == $tag' \
+              release.json
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+              --repo Smethan/meshtastic-firmware --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo Smethan/meshtastic-firmware --notes "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --repo Smethan/meshtastic-firmware \
+              --verify-tag \
+              --draft \
+              --notes "$notes"
+          fi
 
   publish-draft-release:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish_draft'
