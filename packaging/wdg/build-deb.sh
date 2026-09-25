@@ -93,11 +93,14 @@ import sys
 
 allowed = {
     "libacl1", "libbluetooth3", "libbsd0", "libc6", "libgcc-s1",
-    "libgpiod2", "libi2c0", "libjsoncpp25", "libsdbus-c++1",
-    "libsdl2-2.0-0", "libssl3", "libstdc++6", "libsystemd0",
-    "libusb-1.0-0", "libuv1", "libyaml-cpp0.7",
+    "libgpiod2", "libi2c0", "libjsoncpp25", "liborcania2.3",
+    "libsdbus-c++1", "libsdl2-2.0-0", "libssl3", "libstdc++6",
+    "libsystemd0", "libulfius2.7", "libusb-1.0-0", "libuv1",
+    "libyaml-cpp0.7",
 }
-required = {"libc6", "libgcc-s1", "libstdc++6"}
+required = {
+    "libc6", "libgcc-s1", "liborcania2.3", "libstdc++6", "libulfius2.7",
+}
 pattern = re.compile(
     r"^([a-z0-9][a-z0-9+.-]*) \(>= ([0-9A-Za-z.+:~_-]+)\)$")
 seen = set()

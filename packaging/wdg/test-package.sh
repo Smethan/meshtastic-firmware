@@ -21,6 +21,8 @@ grep -q 'GPL-3.0-only' "$BUILD"
 grep -q '"source_ref"' "$BUILD"
 grep -q 'copyright >SHA256SUMS' "$BUILD"
 grep -q 'unreviewed runtime dependency' "$BUILD"
+grep -q '"liborcania2.3"' "$BUILD"
+grep -q '"libulfius2.7"' "$BUILD"
 grep -qx 'd /run/lock/watchdogs 2750 root watchdogs -' "$TMPFILES"
 grep -qx 'f /run/lock/watchdogs/aio-sx1262.lock 0660 root watchdogs -' "$TMPFILES"
 
