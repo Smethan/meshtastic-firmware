@@ -3,7 +3,7 @@ name: WDG Portduino
 on:
   push:
     branches: [wdg-main, wdg-portduino-bluez]
-    tags: ['v*.*.*-wdg.*']
+    tags: ["v*.*.*-wdg.*"]
   pull_request:
     branches: [wdg-main]
   workflow_dispatch:
@@ -23,11 +23,11 @@ on:
       tested_run_id:
         description: Tag workflow run ID whose immutable artifact passed hardware acceptance
         required: false
-        default: ''
+        default: ""
       tested_artifact_attempt:
         description: Producer attempt embedded in the tested artifact name
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: read
