@@ -7,12 +7,36 @@ on:
   pull_request:
     branches: [wdg-main]
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Build an artifact or publish an already tested draft release
+        required: true
+        default: package
+        type: choice
+        options:
+          - package
+          - publish_draft
+      package_tag:
+        description: Package version matching vMAJOR.MINOR.PATCH-wdg.N
+        required: true
+        default: v2.8.0-wdg.0
+      tested_run_id:
+        description: Tag workflow run ID whose immutable artifact passed hardware acceptance
+        required: false
+        default: ''
+      tested_artifact_attempt:
+        description: Producer attempt embedded in the tested artifact name
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: wdg-portduino-${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    wdg-portduino-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{
+    github.event_name == 'workflow_dispatch' && format('{0}-{1}', inputs.operation,
+    inputs.package_tag) || 'source' }}
   cancel-in-progress: true
 
 jobs:
@@ -21,16 +45,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'publish_draft' && inputs.package_tag || github.sha }}
           submodules: recursive
           persist-credentials: false
       - name: Formatting and policy
-        uses: trunk-io/trunk-action@v2.0.0
+        uses: trunk-io/trunk-action@e1234e67a86010d61ddac8d8ebf4b783e2ffd2fa
         with:
           cache: false
       - name: Package policy
         run: ./packaging/wdg/test-package.sh
 
   native:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'publish_draft'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -45,10 +71,11 @@ jobs:
             build-essential git python3-pip pkg-config \
             libbluetooth-dev libgpiod-dev libyaml-cpp-dev libjsoncpp-dev \
             libssl-dev libulfius-dev liborcania-dev libusb-1.0-0-dev \
-            libi2c-dev libuv1-dev libcurl4-gnutls-dev libsdbus-c++-dev
+            libi2c-dev libuv1-dev libcurl4-gnutls-dev libsdbus-c++-dev \
+            libacl1-dev
           python3 -m pip install --break-system-packages platformio
       - name: Restore PlatformIO cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ~/.platformio/.cache
           key: wdg-native-${{ runner.os }}-${{ hashFiles('platformio.ini', 'variants/native/**/*.ini') }}
@@ -57,19 +84,27 @@ jobs:
         run: pio run -e native
       - name: Build WDG native
         run: pio run -e native-wdg
+      - name: Validate simulated candidate config loading
+        run: ./bin/test-sim-config.sh .pio/build/native-wdg/meshtasticd
       - name: Config validation
         run: ./bin/test-config-check.sh .pio/build/native-wdg/meshtasticd
       - name: Complete native tests
         run: ./bin/run-tests.sh
+      - name: Complete WDG native tests
+        run: ./bin/run-tests.sh -e native-wdg
 
   package-arm64:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.operation == 'package')
     needs: [policy, native]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
-    container: debian:bookworm
-    permissions:
-      contents: write
+    container: debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
+      artifact_name: ${{ steps.artifact.outputs.name }}
+      artifact_attempt: ${{ steps.artifact.outputs.attempt }}
     steps:
       - name: Install checkout prerequisites
         run: apt-get update && apt-get install -y git ca-certificates
@@ -77,6 +112,9 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+      - name: Record the exact source commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Install Bookworm ARM64 build dependencies
         run: |
           apt-get update
@@ -85,42 +123,208 @@ jobs:
             dpkg-dev libbluetooth-dev libgpiod-dev libyaml-cpp-dev \
             libjsoncpp-dev libssl-dev libulfius-dev liborcania-dev \
             libusb-1.0-0-dev libi2c-dev libuv1-dev libcurl4-gnutls-dev \
-            libsdbus-c++-dev binutils gh
+            libsdbus-c++-dev libacl1-dev binutils
           python3 -m venv /opt/pio
           /opt/pio/bin/pip install platformio
       - name: Build ARM64 native-wdg
         run: /opt/pio/bin/pio run -e native-wdg
       - name: Build side-by-side Debian package
         env:
-          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v2.8.0-wdg.0' }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.package_tag || github.ref_name }}
+          MESHTASTIC_SOURCE_REF: ${{ github.event_name == 'push' && github.ref_name || format('commit:{0}', github.sha) }}
         run: ./packaging/wdg/build-deb.sh "$RELEASE_TAG"
-      - name: Install package in clean Bookworm container
+      - name: Name immutable package artifact
+        id: artifact
         run: |
-          deb=$(find dist -maxdepth 1 -name 'meshtasticd-wdg_*_arm64.deb' -print -quit)
-          test -n "$deb"
-          dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb"
-          dpkg --unpack "$deb"
-          test -x /usr/lib/meshtasticd-wdg/meshtasticd
-          test -f /usr/lib/systemd/system/meshtasticd-wdg.service
-          test ! -e /usr/bin/meshtasticd
+          echo "name=meshtasticd-wdg-arm64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "attempt=${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: meshtasticd-wdg-arm64
+          name: ${{ steps.artifact.outputs.name }}
+          if-no-files-found: error
           path: |
             dist/meshtasticd-wdg_*_arm64.deb
             dist/compatibility.json
             dist/SHA256SUMS
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
+            dist/SOURCE.txt
+            dist/copyright
+
+  verify-package-arm64:
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.operation == 'package')
+    needs: package-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    container: debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ needs.package-arm64.outputs.artifact_name }}
+          path: dist
+      - name: Verify checksums before installation
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq
+          package_count=$(find . -maxdepth 1 -type f -name 'meshtasticd-wdg_*_arm64.deb' | wc -l)
+          test "$package_count" -eq 1
+          deb=$(find . -maxdepth 1 -type f -name 'meshtasticd-wdg_*_arm64.deb' -printf '%f\n')
+          test "$(jq -r '.package.asset' compatibility.json)" = "$deb"
+          test "$(jq -r '.package.size' compatibility.json)" = "$(stat -c %s "$deb")"
+          test "$(jq -r '.package.sha256' compatibility.json)" = "$(sha256sum "$deb" | awk '{print $1}')"
+          test "$(jq -r '.tag' compatibility.json)" = "${{ github.event_name == 'workflow_dispatch' && inputs.package_tag || github.ref_name }}"
+          test "$(jq -r '.source_commit' compatibility.json)" = "${{ needs.package-arm64.outputs.source_commit }}"
+          test "$(jq -r '.source_ref' compatibility.json)" = "${{ github.event_name == 'push' && github.ref_name || format('commit:{0}', github.sha) }}"
+          test "$(jq -r '.source_url' compatibility.json)" = "https://github.com/Smethan/meshtastic-firmware/tree/${{ needs.package-arm64.outputs.source_commit }}"
+      - name: Install package with runtime dependencies
+        run: |
+          deb=$(find dist -maxdepth 1 -name 'meshtasticd-wdg_*_arm64.deb' -print -quit)
+          test -n "$deb"
+          test "$(dpkg-deb --field "$deb" Architecture)" = arm64
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$PWD/$deb"
+          apt-get check
+          dpkg --audit
+          dpkg --verify meshtasticd-wdg
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils file
+          dpkg-query --show --showformat='${db:Status-Abbrev} ${Architecture}\n' meshtasticd-wdg | grep -qx 'ii  arm64'
+      - name: Verify manifest and installed package
+        run: |
+          cd dist
+          jq -e '.repository == "Smethan/meshtastic-firmware"' compatibility.json
+          jq -e '.package.name == "meshtasticd-wdg"' compatibility.json
+          jq -e '.package.architecture == "arm64"' compatibility.json
+          jq -e '.wdg_api.major == 1' compatibility.json
+          jq -e '.license == "GPL-3.0-only"' compatibility.json
+          jq -e '.source_commit | test("^[0-9a-f]{40}$")' compatibility.json
+          test -s SOURCE.txt
+          test -s copyright
+          test -x /usr/lib/meshtasticd-wdg/meshtasticd
+          test -f /usr/lib/systemd/system/meshtasticd-wdg.service
+          test ! -e /usr/bin/meshtasticd
+          file /usr/lib/meshtasticd-wdg/meshtasticd | grep -q 'ARM aarch64'
+          ! ldd /usr/lib/meshtasticd-wdg/meshtasticd | grep -q 'not found'
+          test "$(stat -c '%a %U %G' /usr/lib/meshtasticd-wdg/meshtasticd)" = '755 root root'
+          for path in \
+            /usr/lib/systemd/system/meshtasticd-wdg.service \
+            /usr/lib/tmpfiles.d/meshtasticd-wdg.conf \
+            /usr/lib/sysusers.d/meshtasticd-wdg.conf \
+            /usr/share/dbus-1/system.d/meshtasticd-wdg.conf \
+            /usr/share/meshtasticd-wdg/wdg-portduino.example.yaml \
+            /usr/share/doc/meshtasticd-wdg/copyright \
+            /usr/share/doc/meshtasticd-wdg/UPSTREAM_BASE \
+            /usr/share/doc/meshtasticd-wdg/compatibility.json; do
+            test "$(stat -c '%a %U %G' "$path")" = '644 root root'
+          done
+
+  stage-draft-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-wdg.')
+    needs: [package-arm64, verify-package-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ needs.package-arm64.outputs.artifact_name }}
+          path: dist
+      - name: Stage tagged release for hardware acceptance
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          dist/meshtasticd-wdg_*_arm64.deb
-          dist/compatibility.json
-          dist/SHA256SUMS
-          --repo Smethan/meshtastic-firmware
-          --verify-tag
-          --generate-notes
+        run: |
+          [[ $GITHUB_REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+-wdg\.[0-9]+$ ]]
+          (cd dist && sha256sum --check SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" \
+            dist/meshtasticd-wdg_*_arm64.deb \
+            dist/compatibility.json \
+            dist/SHA256SUMS \
+            dist/SOURCE.txt \
+            dist/copyright \
+            --repo Smethan/meshtastic-firmware \
+            --verify-tag \
+            --draft \
+            --notes "Hardware acceptance candidate. Immutable Actions artifact: run ${GITHUB_RUN_ID}, producer attempt ${{ needs.package-arm64.outputs.artifact_attempt }}, name ${{ needs.package-arm64.outputs.artifact_name }}."
+
+  publish-draft-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish_draft'
+    needs: policy
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Validate requested tag
+        env:
+          RELEASE_TAG: ${{ inputs.package_tag }}
+          TESTED_RUN_ID: ${{ inputs.tested_run_id }}
+          TESTED_ARTIFACT_ATTEMPT: ${{ inputs.tested_artifact_attempt }}
+        run: |
+          [[ $RELEASE_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+-wdg\.[0-9]+$ ]]
+          [[ $TESTED_RUN_ID =~ ^[1-9][0-9]*$ ]]
+          [[ $TESTED_ARTIFACT_ATTEMPT =~ ^[1-9][0-9]*$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.package_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and publish the tested draft bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.package_tag }}
+          TESTED_RUN_ID: ${{ inputs.tested_run_id }}
+          TESTED_ARTIFACT_ATTEMPT: ${{ inputs.tested_artifact_attempt }}
+        run: |
+          mkdir -p dist tested-dist
+          gh release view "$RELEASE_TAG" \
+            --repo Smethan/meshtastic-firmware \
+            --json isDraft,isPrerelease,tagName > release.json
+          jq -e --arg tag "$RELEASE_TAG" \
+            '.isDraft == true and .isPrerelease == false and .tagName == $tag' \
+            release.json
+          gh release download "$RELEASE_TAG" \
+            --repo Smethan/meshtastic-firmware --dir dist
+          [[ $RELEASE_TAG =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-wdg\.([0-9]+)$ ]]
+          deb="meshtasticd-wdg_${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}+wdg${BASH_REMATCH[4]}_arm64.deb"
+          source_commit=$(git rev-parse HEAD)
+          gh api \
+            "repos/Smethan/meshtastic-firmware/actions/runs/${TESTED_RUN_ID}/attempts/${TESTED_ARTIFACT_ATTEMPT}" \
+            > tested-run.json
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg sha "$source_commit" \
+            --argjson attempt "$TESTED_ARTIFACT_ATTEMPT" \
+            '.repository.full_name == "Smethan/meshtastic-firmware"
+             and .path == ".github/workflows/wdg-native.yml"
+             and .event == "push"
+             and .status == "completed"
+             and .conclusion == "success"
+             and .head_branch == $tag
+             and .head_sha == $sha
+             and .run_attempt == $attempt' tested-run.json
+          artifact_name="meshtasticd-wdg-arm64-${TESTED_RUN_ID}-${TESTED_ARTIFACT_ATTEMPT}"
+          gh api \
+            "repos/Smethan/meshtastic-firmware/actions/runs/${TESTED_RUN_ID}/artifacts?per_page=100" \
+            > artifacts.json
+          test "$(jq --arg name "$artifact_name" \
+            '[.artifacts[] | select(.name == $name and .expired == false)] | length' \
+            artifacts.json)" -eq 1
+          gh run download "$TESTED_RUN_ID" \
+            --repo Smethan/meshtastic-firmware \
+            --name "$artifact_name" --dir tested-dist
+          ./packaging/wdg/verify-tested-assets.sh dist tested-dist "$deb"
+          test "$(jq -r '.tag' dist/compatibility.json)" = "$RELEASE_TAG"
+          test "$(jq -r '.source_ref' dist/compatibility.json)" = "$RELEASE_TAG"
+          test "$(jq -r '.source_commit' dist/compatibility.json)" = "$source_commit"
+          test "$(jq -r '.source_url' dist/compatibility.json)" = \
+            "https://github.com/Smethan/meshtastic-firmware/tree/$source_commit"
+          test "$(jq -r '.package.asset' dist/compatibility.json)" = "$deb"
+          test "$(jq -r '.package.size' dist/compatibility.json)" = "$(stat -c %s "dist/$deb")"
+          test "$(jq -r '.package.sha256' dist/compatibility.json)" = \
+            "$(sha256sum "dist/$deb" | awk '{print $1}')"
+          gh release edit "$RELEASE_TAG" \
+            --repo Smethan/meshtastic-firmware --draft=false
