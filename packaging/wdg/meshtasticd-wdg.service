@@ -16,7 +16,9 @@ RuntimeDirectoryMode=0770
 UMask=0007
 Environment=MESHTASTIC_WDG_POLICY=/etc/meshtasticd/wdg-portduino.yaml
 ExecStartPre=/usr/bin/test -r /etc/meshtasticd/config.yaml
-ExecStart=/usr/bin/flock -n -E 75 /run/lock/watchdogs/aio-sx1262.lock /usr/lib/meshtasticd-wdg/meshtasticd --config=/etc/meshtasticd/config.yaml --fsdir=/var/lib/meshtasticd
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStart=/usr/bin/flock -n -E 75 /run/lock/watchdogs/aio-sx1262.lock /usr/lib/meshtasticd-wdg/meshtasticd --config=/etc/meshtasticd/config.yaml --fsdir=/var/lib/meshtasticd/.portduino/default
 Restart=on-failure
 RestartSec=3
 RestartPreventExitStatus=75
