@@ -41,8 +41,8 @@ SOURCE_REF=${MESHTASTIC_SOURCE_REF:-$TAG}
 MAX_GLIBC=$(readelf --version-info "$BINARY" |
 	sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' |
 	sort -V | tail -n 1)
-if [[ -z $MAX_GLIBC ]] || ! dpkg --compare-versions "$MAX_GLIBC" le 2.36; then
-	echo "binary requires glibc ${MAX_GLIBC:-unknown}; Bookworm limit is 2.36" >&2
+if [[ -z $MAX_GLIBC ]] || ! dpkg --compare-versions "$MAX_GLIBC" le 2.41; then
+	echo "binary requires glibc ${MAX_GLIBC:-unknown}; Trixie limit is 2.41" >&2
 	exit 2
 fi
 
@@ -93,13 +93,14 @@ import sys
 
 allowed = {
     "libacl1", "libbluetooth3", "libbsd0", "libc6", "libgcc-s1",
-    "libgpiod2", "libi2c0", "libjsoncpp25", "liborcania2.3",
-    "libsdbus-c++1", "libsdl2-2.0-0", "libssl3", "libstdc++6",
-    "libsystemd0", "libulfius2.7", "libusb-1.0-0", "libuv1",
-    "libyaml-cpp0.7",
+    "libgpiod3", "libi2c0", "libjsoncpp26", "liborcania2.3",
+    "libsdbus-c++2", "libsdl2-2.0-0", "libssl3t64", "libstdc++6",
+    "libsystemd0", "libulfius2.7t64", "libusb-1.0-0", "libuv1t64",
+    "libyaml-cpp0.8",
 }
 required = {
-    "libc6", "libgcc-s1", "liborcania2.3", "libstdc++6", "libulfius2.7",
+    "libc6", "libgcc-s1", "liborcania2.3", "libstdc++6",
+    "libulfius2.7t64",
 }
 pattern = re.compile(
     r"^([a-z0-9][a-z0-9+.-]*) \(>= ([0-9A-Za-z.+:~_-]+)\)$")
@@ -155,7 +156,7 @@ print(json.dumps({
         "architecture": "arm64",
         "asset": asset,
     },
-    "minimum_glibc": "2.36",
+    "minimum_glibc": "2.41",
     "artifact_digest_source": "GitHub release compatibility.json",
 }, indent=2, sort_keys=True))
 PY
@@ -190,7 +191,7 @@ print(json.dumps({
         "size": int(size),
         "sha256": sha256,
     },
-    "minimum_glibc": "2.36",
+    "minimum_glibc": "2.41",
     "built_glibc_requirement": glibc,
 }, indent=2, sort_keys=True))
 PY

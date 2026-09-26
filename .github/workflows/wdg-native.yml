@@ -130,7 +130,7 @@ jobs:
     needs: [policy, native]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
-    container: debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+    container: debian:trixie@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c
     outputs:
       source_commit: ${{ steps.source.outputs.commit }}
       artifact_name: ${{ steps.artifact.outputs.name }}
@@ -144,8 +144,8 @@ jobs:
           persist-credentials: false
       - name: Record the exact source commit
         id: source
-        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Install Bookworm ARM64 build dependencies
+        run: echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: Install Trixie ARM64 build dependencies
         run: |
           apt-get update
           apt-get install -y \
@@ -161,6 +161,7 @@ jobs:
       - name: Build side-by-side Debian package
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.package_tag || github.ref_name }}
+          MESHTASTIC_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           MESHTASTIC_SOURCE_REF: ${{ github.event_name == 'push' && github.ref_name || format('commit:{0}', github.sha) }}
         run: ./packaging/wdg/build-deb.sh "$RELEASE_TAG"
       - name: Name immutable package artifact
@@ -187,7 +188,7 @@ jobs:
     needs: package-arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
-    container: debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+    container: debian:trixie@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c
     steps:
       - name: Download package artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
