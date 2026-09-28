@@ -230,6 +230,7 @@ jobs:
           jq -e '.package.name == "meshtasticd-wdg"' compatibility.json
           jq -e '.package.architecture == "arm64"' compatibility.json
           jq -e '.wdg_api.major == 1' compatibility.json
+          jq -e '.wdg_api.minor == 1' compatibility.json
           jq -e '.license == "GPL-3.0-only"' compatibility.json
           jq -e '.source_commit | test("^[0-9a-f]{40}$")' compatibility.json
           test -s SOURCE.txt

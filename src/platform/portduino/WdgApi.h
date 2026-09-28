@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <sys/types.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -36,10 +37,14 @@ class WdgApi : public concurrency::OSThread
 {
   public:
     static constexpr uint32_t PROTOCOL_VERSION = 1;
+    static constexpr uint32_t API_MAJOR_VERSION = 1;
+    static constexpr uint32_t API_MINOR_VERSION = 1;
     static constexpr size_t MAX_PACKET_BYTES = 65536;
     static constexpr size_t MAX_PENDING_REPLIES = 256;
     static constexpr size_t MAX_PENDING_REPLY_BYTES = 1024 * 1024;
     static constexpr size_t MAX_ACCEPTS_PER_POLL = 8;
+    static constexpr size_t MAX_PENDING_DIRECT_SENDS = 64;
+    static constexpr uint32_t DIRECT_SEND_TIMEOUT_MS = 120 * 1000;
 
     using PeerAuthorizer = std::function<bool(const WdgPeerCredentials &)>;
 
@@ -60,6 +65,7 @@ class WdgApi : public concurrency::OSThread
     int32_t runOnce() override;
     static bool applyPathAccessControl(const std::string &path, uid_t allowedUid, bool directory);
     static bool sanitizeTextPayload(const std::string &requested, std::string &sanitized);
+    static bool defaultWantAck(NodeNum destination);
 
   private:
     bool openListener();
@@ -73,6 +79,7 @@ class WdgApi : public concurrency::OSThread
     void pumpSnapshot();
     void drainObserverInbox();
     void pumpNodeUpdates();
+    void expireDirectSends();
     void expireBluetoothLeases();
     void pollRuntimeState();
     Json::Value makeStatusBody() const;
@@ -101,6 +108,19 @@ class WdgApi : public concurrency::OSThread
         PacketId packetId = 0;
     };
 
+    struct PendingDeliveryEvent {
+        PacketId packetId = 0;
+        NodeNum sender = 0;
+        NodeNum recipient = 0;
+        meshtastic_Routing_Error error = meshtastic_Routing_Error_NONE;
+    };
+
+    struct PendingDirectSend {
+        std::string requestId;
+        NodeNum destination = 0;
+        uint32_t startedMsec = 0;
+    };
+
     std::string socketPath;
     PeerAuthorizer peerAuthorizer;
     int listenFd = -1;
@@ -123,6 +143,7 @@ class WdgApi : public concurrency::OSThread
     std::mutex observerInboxMutex;
     std::set<NodeNum> observerNodeUpdates;
     std::deque<PendingTextEvent> observerTextEvents;
+    std::deque<PendingDeliveryEvent> observerDeliveryEvents;
     size_t observerTextBytes = 0;
     size_t observerDroppedEvents = 0;
     bool clientHelloComplete = false;
@@ -139,14 +160,26 @@ class WdgApi : public concurrency::OSThread
     std::string lastBleStatus;
     std::string lastRadioStatus;
     std::string lastFullClientOwner;
+    std::string lastPhoneBondState;
     uint64_t lastPasskeyToken = 0;
     std::deque<std::string> recentRequestIds;
     std::unordered_set<std::string> recentRequestIdSet;
+    std::unordered_map<PacketId, PendingDirectSend> pendingDirectSends;
     CallbackObserver<WdgApi, NodeNum> nodeObserver = CallbackObserver<WdgApi, NodeNum>(this, &WdgApi::onNodeChanged);
     CallbackObserver<WdgApi, const meshtastic_MeshPacket *> remotePacketObserver =
         CallbackObserver<WdgApi, const meshtastic_MeshPacket *>(this, &WdgApi::onRemotePacketAccepted);
     CallbackObserver<WdgApi, const meshtastic_MeshPacket *> textObserver =
         CallbackObserver<WdgApi, const meshtastic_MeshPacket *>(this, &WdgApi::onTextMessage);
+
+#ifdef PIO_UNIT_TESTING
+  public:
+    void testTrackDirectSend(PacketId packetId, const std::string &requestId, NodeNum destination, uint32_t startedMsec);
+    int testAcceptRemotePacket(const meshtastic_MeshPacket *packet);
+    void testDrainObserverInbox();
+    void testExpireDirectSends();
+    void testFillCriticalReplyQueue();
+    size_t testPendingDirectSendCount() const;
+#endif
 };
 
 } // namespace meshtastic::portduino

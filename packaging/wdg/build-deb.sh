@@ -149,7 +149,7 @@ print(json.dumps({
     "source_url": f"https://github.com/Smethan/meshtastic-firmware/tree/{source_commit}",
     "source_ref": source_ref,
     "license": "GPL-3.0-only",
-    "wdg_api": {"major": 1, "minor": 0},
+    "wdg_api": {"major": 1, "minor": 1},
     "package": {
         "name": "meshtasticd-wdg",
         "version": version,
@@ -182,7 +182,7 @@ print(json.dumps({
     "source_url": f"https://github.com/Smethan/meshtastic-firmware/tree/{source_commit}",
     "source_ref": source_ref,
     "license": "GPL-3.0-only",
-    "wdg_api": {"major": 1, "minor": 0},
+    "wdg_api": {"major": 1, "minor": 1},
     "package": {
         "name": "meshtasticd-wdg",
         "version": version,

@@ -38,6 +38,7 @@ class TestWdgApi : public WdgApi
 {
   public:
     using WdgApi::applyPathAccessControl;
+    using WdgApi::defaultWantAck;
     using WdgApi::runOnce;
     using WdgApi::sanitizeTextPayload;
     using WdgApi::WdgApi;
@@ -127,6 +128,25 @@ static bool arrayContains(const Json::Value &array, const char *value)
         if (entry.isString() && entry.asString() == value)
             return true;
     return false;
+}
+
+static meshtastic_MeshPacket routingPacket(PacketId requestId, NodeNum sender, NodeNum recipient, pb_size_t variant,
+                                           meshtastic_Routing_Error error = meshtastic_Routing_Error_NONE)
+{
+    meshtastic_Routing routing = meshtastic_Routing_init_zero;
+    routing.which_variant = variant;
+    if (variant == meshtastic_Routing_error_reason_tag)
+        routing.error_reason = error;
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.from = sender;
+    packet.to = recipient;
+    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    packet.decoded.portnum = meshtastic_PortNum_ROUTING_APP;
+    packet.decoded.request_id = requestId;
+    packet.decoded.payload.size =
+        pb_encode_to_bytes(packet.decoded.payload.bytes, sizeof(packet.decoded.payload.bytes), &meshtastic_Routing_msg, &routing);
+    TEST_ASSERT_GREATER_THAN_UINT(0, packet.decoded.payload.size);
+    return packet;
 }
 
 void setUp()
@@ -370,11 +390,21 @@ void test_hello_and_status_echo_request_ids()
     TEST_ASSERT_TRUE(hello["ok"].asBool());
     TEST_ASSERT_EQUAL_STRING("hello-1", hello["request_id"].asCString());
     TEST_ASSERT_EQUAL_UINT32(1, hello["body"]["protocol_version"].asUInt());
+    TEST_ASSERT_EQUAL_STRING("1.1", hello["body"]["api_version"].asCString());
+    TEST_ASSERT_EQUAL_UINT32(1, hello["body"]["api_major"].asUInt());
+    TEST_ASSERT_EQUAL_UINT32(1, hello["body"]["api_minor"].asUInt());
+    TEST_ASSERT_EQUAL_UINT32(1, hello["body"]["api"]["major"].asUInt());
+    TEST_ASSERT_EQUAL_UINT32(1, hello["body"]["api"]["minor"].asUInt());
     TEST_ASSERT_EQUAL_UINT64(WdgApi::MAX_PACKET_BYTES, hello["body"]["max_packet_bytes"].asUInt64());
     TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "snapshot_nodes"));
     TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "send_text"));
     TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "request_node_info"));
     TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "ble_scan_lease_acquire"));
+    TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "set_phone_pairing_mode"));
+    TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "adopt_phone_bond"));
+    TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "clear_phone_identity"));
+    TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "phone_bond"));
+    TEST_ASSERT_TRUE(arrayContains(hello["body"]["capabilities"], "send_status"));
 
     Json::Value status =
         exchange(*testApi, client, R"({"v":1,"type":"command","request_id":"status-1","name":"get_status","body":{}})");
@@ -382,6 +412,46 @@ void test_hello_and_status_echo_request_ids()
     TEST_ASSERT_EQUAL_STRING("status-1", status["request_id"].asCString());
     TEST_ASSERT_EQUAL_STRING("ready", status["body"]["state"].asCString());
     TEST_ASSERT_EQUAL_STRING("unavailable", status["body"]["radio_status"].asCString());
+    TEST_ASSERT_TRUE(status["body"]["phone_bond"].isMember("present"));
+    TEST_ASSERT_TRUE(status["body"]["phone_bond"].isMember("controller"));
+    TEST_ASSERT_TRUE(status["body"]["phone_bond"].isMember("service_authorized"));
+    TEST_ASSERT_TRUE(status["body"]["phone_bond"].isMember("authentication"));
+}
+
+void test_identity_commands_require_exact_security_inputs()
+{
+    testApi = new TestWdgApi(socketPath);
+    TEST_ASSERT_TRUE(testApi->start());
+    int client = connectClient(socketPath);
+    testApi->runOnce();
+
+    Json::Value adopt = exchange(
+        *testApi, client,
+        R"({"v":1,"type":"command","request_id":"adopt-no-controller","name":"adopt_phone_bond","body":{"address":"11:22:33:44:55:66"}})");
+    TEST_ASSERT_FALSE(adopt["ok"].asBool());
+    TEST_ASSERT_EQUAL_STRING("invalid_controller", adopt["error_code"].asCString());
+
+    Json::Value clear = exchange(
+        *testApi, client, R"({"v":1,"type":"command","request_id":"clear-no-address","name":"clear_phone_identity","body":{}})");
+    TEST_ASSERT_FALSE(clear["ok"].asBool());
+    TEST_ASSERT_EQUAL_STRING("invalid_address", clear["error_code"].asCString());
+
+    Json::Value mode =
+        exchange(*testApi, client,
+                 R"({"v":1,"type":"command","request_id":"open-mode","name":"set_phone_pairing_mode","body":{"mode":"no_pin"}})");
+    TEST_ASSERT_FALSE(mode["ok"].asBool());
+    TEST_ASSERT_EQUAL_STRING("unsupported_pairing_mode", mode["error_code"].asCString());
+
+    config.bluetooth.mode = meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN;
+    Json::Value open = exchange(
+        *testApi, client, R"({"v":1,"type":"command","request_id":"open-no-pin","name":"open_pairing","body":{"seconds":60}})");
+    TEST_ASSERT_FALSE(open["ok"].asBool());
+    TEST_ASSERT_EQUAL_STRING("authenticated_pairing_required", open["error_code"].asCString());
+    Json::Value insecureAdopt = exchange(
+        *testApi, client,
+        R"({"v":1,"type":"command","request_id":"adopt-no-pin","name":"adopt_phone_bond","body":{"address":"11:22:33:44:55:66","controller":"AA:BB:CC:DD:EE:FF"}})");
+    TEST_ASSERT_FALSE(insecureAdopt["ok"].asBool());
+    TEST_ASSERT_EQUAL_STRING("authenticated_pairing_required", insecureAdopt["error_code"].asCString());
 }
 
 void test_status_reports_key_presence_without_key_material()
@@ -526,6 +596,94 @@ void test_text_sanitization_enforces_encoded_payload_limit()
     const std::string invalidPastLimit(78, static_cast<char>(0xff));
     TEST_ASSERT_FALSE(TestWdgApi::sanitizeTextPayload(invalidPastLimit, sanitized));
     TEST_ASSERT_EQUAL_UINT(234, sanitized.size());
+}
+
+void test_broadcast_send_defaults_to_no_ack()
+{
+    TEST_ASSERT_FALSE(TestWdgApi::defaultWantAck(NODENUM_BROADCAST));
+    TEST_ASSERT_TRUE(TestWdgApi::defaultWantAck(0x12345678));
+}
+
+void test_direct_delivery_accepts_only_correlated_routing_error_results()
+{
+    createNodeDbFixture();
+    constexpr PacketId PACKET_ID = 0x10203040;
+    constexpr NodeNum DESTINATION = 0x12345678;
+    const NodeNum self = nodeDB->getNodeNum();
+    testApi = new TestWdgApi(socketPath);
+
+    testApi->testTrackDirectSend(PACKET_ID, "direct-1", DESTINATION, Time::getMillis());
+    meshtastic_MeshPacket routeReply = routingPacket(PACKET_ID, DESTINATION, self, meshtastic_Routing_route_reply_tag);
+    testApi->testAcceptRemotePacket(&routeReply);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(1, testApi->testPendingDirectSendCount());
+
+    meshtastic_MeshPacket wrongSender = routingPacket(PACKET_ID, 0x87654321, self, meshtastic_Routing_error_reason_tag);
+    testApi->testAcceptRemotePacket(&wrongSender);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(1, testApi->testPendingDirectSendCount());
+
+    meshtastic_MeshPacket wrongRecipient = routingPacket(PACKET_ID, DESTINATION, 0x22222222, meshtastic_Routing_error_reason_tag);
+    testApi->testAcceptRemotePacket(&wrongRecipient);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(1, testApi->testPendingDirectSendCount());
+
+    meshtastic_MeshPacket delivered = routingPacket(PACKET_ID, DESTINATION, self, meshtastic_Routing_error_reason_tag);
+    testApi->testAcceptRemotePacket(&delivered);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(0, testApi->testPendingDirectSendCount());
+
+    testApi->testAcceptRemotePacket(&delivered);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(0, testApi->testPendingDirectSendCount());
+
+    testApi->testTrackDirectSend(PACKET_ID + 1, "direct-2", DESTINATION, Time::getMillis());
+    meshtastic_MeshPacket destinationNak =
+        routingPacket(PACKET_ID + 1, DESTINATION, self, meshtastic_Routing_error_reason_tag, meshtastic_Routing_Error_NO_ROUTE);
+    testApi->testAcceptRemotePacket(&destinationNak);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(0, testApi->testPendingDirectSendCount());
+
+    testApi->testTrackDirectSend(PACKET_ID + 2, "direct-3", DESTINATION, Time::getMillis());
+    meshtastic_MeshPacket localTimeout =
+        routingPacket(PACKET_ID + 2, self, self, meshtastic_Routing_error_reason_tag, meshtastic_Routing_Error_MAX_RETRANSMIT);
+    testApi->testAcceptRemotePacket(&localTimeout);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_EQUAL_UINT(0, testApi->testPendingDirectSendCount());
+}
+
+void test_direct_delivery_and_timeout_survive_critical_queue_overflow()
+{
+    createNodeDbFixture();
+    constexpr PacketId PACKET_ID = 0x40302010;
+    constexpr NodeNum DESTINATION = 0x12345678;
+    const NodeNum self = nodeDB->getNodeNum();
+    testApi = new TestWdgApi(socketPath);
+    TEST_ASSERT_TRUE(testApi->start());
+    int client = connectClient(socketPath);
+    testApi->runOnce();
+    TEST_ASSERT_TRUE(testApi->hasClient());
+
+    testApi->testTrackDirectSend(PACKET_ID, "overflow-delivery", DESTINATION, Time::getMillis());
+    testApi->testFillCriticalReplyQueue();
+    meshtastic_MeshPacket delivered = routingPacket(PACKET_ID, DESTINATION, self, meshtastic_Routing_error_reason_tag);
+    testApi->testAcceptRemotePacket(&delivered);
+    testApi->testDrainObserverInbox();
+    TEST_ASSERT_FALSE(testApi->hasClient());
+    TEST_ASSERT_EQUAL_UINT(0, testApi->testPendingDirectSendCount());
+
+    delete testApi;
+    testApi = new TestWdgApi(socketPath);
+    TEST_ASSERT_TRUE(testApi->start());
+    client = connectClient(socketPath);
+    testApi->runOnce();
+    TEST_ASSERT_TRUE(testApi->hasClient());
+    Time::setTestMillis(WdgApi::DIRECT_SEND_TIMEOUT_MS + 1);
+    testApi->testTrackDirectSend(PACKET_ID + 1, "overflow-timeout", DESTINATION, 0);
+    testApi->testFillCriticalReplyQueue();
+    testApi->testExpireDirectSends();
+    TEST_ASSERT_FALSE(testApi->hasClient());
+    TEST_ASSERT_EQUAL_UINT(0, testApi->testPendingDirectSendCount());
 }
 
 void test_protocol_errors_are_bounded_replies()
@@ -842,11 +1000,15 @@ void setup()
     RUN_TEST(test_bluetooth_adapter_refresh_recovers_after_hotplug);
     RUN_TEST(test_explicit_bluetooth_adapter_survives_auto_policy_refresh);
     RUN_TEST(test_hello_and_status_echo_request_ids);
+    RUN_TEST(test_identity_commands_require_exact_security_inputs);
     RUN_TEST(test_status_reports_key_presence_without_key_material);
     RUN_TEST(test_status_reports_non_secret_phone_pairing_mode);
     RUN_TEST(test_status_reports_full_phone_api_owner_and_transition);
     RUN_TEST(test_packets_received_counts_accepted_remote_packets_without_a_phone_client);
     RUN_TEST(test_text_sanitization_enforces_encoded_payload_limit);
+    RUN_TEST(test_broadcast_send_defaults_to_no_ack);
+    RUN_TEST(test_direct_delivery_accepts_only_correlated_routing_error_results);
+    RUN_TEST(test_direct_delivery_and_timeout_survive_critical_queue_overflow);
     RUN_TEST(test_protocol_errors_are_bounded_replies);
     RUN_TEST(test_request_ids_are_required_and_cannot_be_replayed);
     RUN_TEST(test_snapshot_streams_cached_nodes_without_phone_queue);

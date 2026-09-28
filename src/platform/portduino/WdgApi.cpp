@@ -60,14 +60,83 @@ const char *const CAPABILITIES[] = {
     "send_text",
     "request_node_info",
     "set_phone_ble",
+    "set_phone_pairing_mode",
     "open_pairing",
     "forget_phone",
+    "adopt_phone_bond",
+    "clear_phone_identity",
+    "phone_bond",
+    "send_status",
     "ble_scan_lease_acquire",
     "ble_scan_lease_release",
     "pairing_agent_lease_acquire",
     "pairing_agent_lease_release",
     "retry_shared_adapter",
 };
+
+const char *phoneBondErrorCode(LinuxBluetooth::PhoneBondActionResult result)
+{
+    using Result = LinuxBluetooth::PhoneBondActionResult;
+    switch (result) {
+    case Result::UNAVAILABLE:
+        return "ble_unavailable";
+    case Result::INVALID_ADDRESS:
+        return "invalid_address";
+    case Result::INVALID_CONTROLLER:
+        return "invalid_controller";
+    case Result::NOT_FOUND:
+        return "bond_not_found";
+    case Result::AMBIGUOUS:
+        return "ambiguous_bond";
+    case Result::NOT_SECURE:
+        return "bond_not_authenticated";
+    case Result::FOREIGN_CONNECTED:
+        return "foreign_phone_connected";
+    case Result::IDENTITY_CONFLICT:
+        return "identity_conflict";
+    case Result::IDENTITY_CHANGED:
+        return "identity_changed";
+    case Result::PERSISTENCE_FAILED:
+        return "identity_persistence_failed";
+    case Result::CONNECTED:
+        return "phone_connected";
+    case Result::OK:
+    default:
+        return "ok";
+    }
+}
+
+const char *phoneBondErrorMessage(LinuxBluetooth::PhoneBondActionResult result)
+{
+    using Result = LinuxBluetooth::PhoneBondActionResult;
+    switch (result) {
+    case Result::UNAVAILABLE:
+        return "Meshtastic phone Bluetooth is unavailable";
+    case Result::INVALID_ADDRESS:
+        return "address must be a Bluetooth address";
+    case Result::INVALID_CONTROLLER:
+        return "controller does not match the selected Adapter1 address";
+    case Result::NOT_FOUND:
+        return "No matching authenticated phone bond exists on the selected controller";
+    case Result::AMBIGUOUS:
+        return "More than one matching phone bond exists on the selected controller";
+    case Result::NOT_SECURE:
+        return "The selected Device1 must be paired, bonded, and trusted";
+    case Result::FOREIGN_CONNECTED:
+        return "Disconnect other phones from the selected controller before adoption";
+    case Result::IDENTITY_CONFLICT:
+        return "Clear the existing phone identity before adopting a replacement";
+    case Result::IDENTITY_CHANGED:
+        return "The retained phone identity changed; refresh status before clearing it";
+    case Result::PERSISTENCE_FAILED:
+        return "The authenticated phone identity could not be stored safely";
+    case Result::CONNECTED:
+        return "Disconnect the phone before clearing its identity";
+    case Result::OK:
+    default:
+        return "";
+    }
+}
 
 std::string compactJson(const Json::Value &value)
 {
@@ -222,6 +291,29 @@ const char *pairingModeName(meshtastic_Config_BluetoothConfig_PairingMode mode)
     default:
         return "unknown";
     }
+}
+
+Json::Value phoneBondJson(const LinuxBluetooth *bluetooth)
+{
+    Json::Value body(Json::objectValue);
+    LinuxBluetooth::PhoneBondStatus status;
+    if (bluetooth)
+        status = bluetooth->getPhoneBondStatus();
+    body["present"] = status.identityPresent;
+    body["identity_present"] = status.identityPresent;
+    body["adoptable"] = status.adoptable;
+    body["ambiguous"] = status.ambiguous;
+    body["address"] = status.address;
+    body["name"] = sanitizeUtf8(reinterpret_cast<const uint8_t *>(status.name.data()), status.name.size());
+    body["controller"] = status.controller.empty() ? selectedWdgBluetoothAdapterAddress() : status.controller;
+    body["paired"] = status.paired;
+    body["bonded"] = status.bonded;
+    body["trusted"] = status.trusted;
+    body["connected"] = status.connected;
+    body["service_authorized"] = status.authorized;
+    body["authorized"] = status.authorized;
+    body["authentication"] = status.authentication;
+    return body;
 }
 
 bool intervalExpired(uint32_t started, uint32_t duration)
@@ -470,6 +562,11 @@ bool WdgApi::sanitizeTextPayload(const std::string &requested, std::string &sani
     return !sanitized.empty() && sanitized.size() <= meshtastic_Constants_DATA_PAYLOAD_LEN;
 }
 
+bool WdgApi::defaultWantAck(NodeNum destination)
+{
+    return !isBroadcast(destination);
+}
+
 void WdgApi::handlePacket(const char *data, size_t length)
 {
     Json::CharReaderBuilder builder;
@@ -530,6 +627,11 @@ void WdgApi::handlePacket(const char *data, size_t length)
 
     if (name == "hello") {
         response["protocol_version"] = PROTOCOL_VERSION;
+        response["api_version"] = "1.1";
+        response["api_major"] = API_MAJOR_VERSION;
+        response["api_minor"] = API_MINOR_VERSION;
+        response["api"]["major"] = API_MAJOR_VERSION;
+        response["api"]["minor"] = API_MINOR_VERSION;
         response["max_packet_bytes"] = static_cast<Json::UInt64>(MAX_PACKET_BYTES);
         Json::Value capabilities(Json::arrayValue);
         for (const char *capability : CAPABILITIES)
@@ -542,6 +644,7 @@ void WdgApi::handlePacket(const char *data, size_t length)
         lastBleStatus = deferredBody["ble_status"].asString();
         lastRadioStatus = deferredBody["radio_status"].asString();
         lastFullClientOwner = deferredBody["full_client_owner"].asString();
+        lastPhoneBondState = compactJson(deferredBody["phone_bond"]);
     } else if (name == "get_status") {
         response = makeStatusBody();
     } else if (name == "snapshot_nodes") {
@@ -597,6 +700,12 @@ void WdgApi::handlePacket(const char *data, size_t length)
             enqueueReply(errorReply(requestId, "invalid_want_ack", "want_ack must be a boolean"));
             return;
         }
+        const bool wantAck = body.isMember("want_ack") ? body["want_ack"].asBool() : defaultWantAck(destination);
+        const bool trackDelivery = !isBroadcast(destination) && wantAck;
+        if (trackDelivery && pendingDirectSends.size() >= MAX_PENDING_DIRECT_SENDS) {
+            enqueueReply(errorReply(requestId, "send_tracking_full", "Too many direct messages are awaiting delivery status"));
+            return;
+        }
         meshtastic_MeshPacket *packet = router->allocForSending();
         if (!packet) {
             enqueueReply(errorReply(requestId, "no_memory", "Could not allocate a mesh packet"));
@@ -609,7 +718,7 @@ void WdgApi::handlePacket(const char *data, size_t length)
         }
         packet->to = destination;
         packet->channel = static_cast<ChannelIndex>(channelValue.asUInt());
-        packet->want_ack = body.get("want_ack", true).asBool();
+        packet->want_ack = wantAck;
         packet->decoded.dest = destination;
         packet->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
         packet->decoded.payload.size = text.size();
@@ -623,6 +732,11 @@ void WdgApi::handlePacket(const char *data, size_t length)
 
         const ChannelIndex effectiveChannel = packet->channel;
         const PacketId packetId = packet->id;
+        if (trackDelivery && pendingDirectSends.count(packetId) != 0) {
+            service->releaseToPool(packet);
+            enqueueReply(errorReply(requestId, "packet_id_collision", "Could not allocate a unique tracked packet ID"));
+            return;
+        }
         const ErrorCode result = service->sendToMeshWithResult(packet, RX_SRC_LOCAL, true);
         if (result != ERRNO_OK && result != ERRNO_SHOULD_RELEASE) {
             Json::Value failed(Json::objectValue);
@@ -633,15 +747,20 @@ void WdgApi::handlePacket(const char *data, size_t length)
             if (!enqueueReply(errorReply(requestId, "send_rejected", "Meshtastic rejected the text packet")))
                 return;
             enqueueEvent("send_failed", failed);
+            failed["state"] = "failed";
+            enqueueEvent("send_status", failed);
             return;
         }
+        if (trackDelivery)
+            pendingDirectSends.emplace(packetId, PendingDirectSend{requestKey, destination, Time::getMillis()});
         response["packet_id"] = packetId;
+        response["want_ack"] = wantAck;
         deferredEvent = "send_accepted";
         deferredBody["request_id"] = requestId;
         deferredBody["packet_id"] = packetId;
         deferredBody["destination"] = nodeId(destination);
         deferredBody["channel"] = effectiveChannel;
-        deferredBody["text"] = text;
+        deferredBody["want_ack"] = wantAck;
     } else if (name == "request_node_info") {
         if (body.isMember("hop_limit") && (!body["hop_limit"].isUInt() || body["hop_limit"].asUInt() != 0)) {
             enqueueReply(errorReply(requestId, "invalid_hop_limit", "WDG discovery is restricted to zero routed hops"));
@@ -755,6 +874,94 @@ void WdgApi::handlePacket(const char *data, size_t length)
         response["adapter"] = wdgPolicy().runtimeAdapterAddress;
         response["controller"] = portduino_config.bluetooth_adapter;
         response["adapter_address"] = selectedWdgBluetoothAdapterAddress();
+    } else if (name == "set_phone_pairing_mode") {
+        if (!body.isMember("mode") || !body["mode"].isString() || body["mode"].asString() != "random_pin") {
+            enqueueReply(errorReply(requestId, "unsupported_pairing_mode", "Only random_pin authenticated pairing is supported"));
+            return;
+        }
+        if (!nodeDB) {
+            enqueueReply(errorReply(requestId, "not_ready", "Configuration storage is not ready"));
+            return;
+        }
+        if (linuxBluetooth && linuxBluetooth->isConnected()) {
+            enqueueReply(errorReply(requestId, "phone_connected", "Disconnect the phone before changing pairing mode"));
+            return;
+        }
+        const auto previousMode = config.bluetooth.mode;
+        const uint32_t previousPin = config.bluetooth.fixed_pin;
+        const bool restart = linuxBluetooth && linuxBluetooth->isEnabled();
+        if (restart)
+            linuxBluetooth->deinit();
+        config.bluetooth.mode = meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN;
+        config.bluetooth.fixed_pin = 0;
+        if (!nodeDB->saveToDisk(SEGMENT_CONFIG)) {
+            config.bluetooth.mode = previousMode;
+            config.bluetooth.fixed_pin = previousPin;
+            if (restart)
+                setBluetoothEnable(true);
+            enqueueReply(errorReply(requestId, "config_persistence_failed", "Authenticated pairing mode could not be saved"));
+            return;
+        }
+        if (restart) {
+            setBluetoothEnable(true);
+            if (!linuxBluetooth || !linuxBluetooth->isEnabled()) {
+                config.bluetooth.mode = previousMode;
+                config.bluetooth.fixed_pin = previousPin;
+                nodeDB->saveToDisk(SEGMENT_CONFIG);
+                setBluetoothEnable(true);
+                enqueueReply(errorReply(requestId, "ble_unavailable", "BlueZ could not restart in authenticated pairing mode"));
+                return;
+            }
+        }
+        response["mode"] = "random_pin";
+        response["authenticated"] = true;
+    } else if (name == "adopt_phone_bond") {
+        if (!body.isMember("address") || !body["address"].isString() || body["address"].asString().empty()) {
+            enqueueReply(errorReply(requestId, "invalid_address", "address must be an exact Bluetooth address"));
+            return;
+        }
+        if (!body.isMember("controller") || !body["controller"].isString() || body["controller"].asString().empty()) {
+            enqueueReply(errorReply(requestId, "invalid_controller", "controller must be the exact selected Adapter1 address"));
+            return;
+        }
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN) {
+            enqueueReply(errorReply(requestId, "authenticated_pairing_required",
+                                    "Set random_pin pairing mode before adopting a shared phone bond"));
+            return;
+        }
+        if (!linuxBluetooth || !linuxBluetooth->isEnabled()) {
+            enqueueReply(errorReply(requestId, "ble_unavailable", "Meshtastic phone Bluetooth is unavailable"));
+            return;
+        }
+        const auto result = linuxBluetooth->adoptPhoneBond(body["address"].asString(), body["controller"].asString());
+        if (result != LinuxBluetooth::PhoneBondActionResult::OK) {
+            enqueueReply(errorReply(requestId, phoneBondErrorCode(result), phoneBondErrorMessage(result)));
+            return;
+        }
+        response["phone_bond"] = phoneBondJson(linuxBluetooth);
+        deferredEvent = "phone_bond";
+        deferredBody = response["phone_bond"];
+        lastPhoneBondState = compactJson(deferredBody);
+    } else if (name == "clear_phone_identity") {
+        if (!body.isMember("expected_address") || !body["expected_address"].isString() ||
+            body["expected_address"].asString().empty()) {
+            enqueueReply(errorReply(requestId, "invalid_address", "expected_address must be the exact retained phone address"));
+            return;
+        }
+        if (!linuxBluetooth) {
+            enqueueReply(errorReply(requestId, "ble_unavailable", "Meshtastic phone Bluetooth is unavailable"));
+            return;
+        }
+        const auto result = linuxBluetooth->clearPhoneIdentity(body["expected_address"].asString());
+        if (result != LinuxBluetooth::PhoneBondActionResult::OK) {
+            enqueueReply(errorReply(requestId, phoneBondErrorCode(result), phoneBondErrorMessage(result)));
+            return;
+        }
+        response["cleared"] = true;
+        response["phone_bond"] = phoneBondJson(linuxBluetooth);
+        deferredEvent = "phone_bond";
+        deferredBody = response["phone_bond"];
+        lastPhoneBondState = compactJson(deferredBody);
     } else if (name == "forget_phone") {
         if (!linuxBluetooth || !linuxBluetooth->isEnabled()) {
             enqueueReply(errorReply(requestId, "ble_unavailable", "Meshtastic phone Bluetooth is unavailable"));
@@ -779,6 +986,11 @@ void WdgApi::handlePacket(const char *data, size_t length)
         seconds = std::min(seconds, LinuxBluetooth::MAX_PAIRING_WINDOW_SECONDS);
         if (wdgPolicy().configured)
             seconds = std::min(seconds, wdgPolicy().pairingWindowSeconds);
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN) {
+            enqueueReply(errorReply(requestId, "authenticated_pairing_required",
+                                    "Set random_pin pairing mode before opening a phone pairing window"));
+            return;
+        }
         if (!linuxBluetooth || !linuxBluetooth->isEnabled()) {
             enqueueReply(errorReply(requestId, "ble_unavailable", "Meshtastic phone Bluetooth is unavailable"));
             return;
@@ -1040,6 +1252,7 @@ Json::Value WdgApi::makeStatusBody() const
     body["phone_ble_pairing_authenticated"] = config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN;
     if (config.bluetooth.mode == meshtastic_Config_BluetoothConfig_PairingMode_FIXED_PIN)
         body["phone_ble_pairing_error"] = "fixed_pin_unsupported";
+    body["phone_bond"] = phoneBondJson(linuxBluetooth);
     return body;
 }
 
@@ -1091,8 +1304,30 @@ int WdgApi::onNodeChanged(NodeNum nodeNum)
 
 int WdgApi::onRemotePacketAccepted(const meshtastic_MeshPacket *packet)
 {
-    if (packet)
-        packetsReceived.fetch_add(1, std::memory_order_relaxed);
+    if (!packet)
+        return 0;
+    packetsReceived.fetch_add(1, std::memory_order_relaxed);
+    if (!observerEventsEnabled.load(std::memory_order_acquire) ||
+        packet->which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+        packet->decoded.portnum != meshtastic_PortNum_ROUTING_APP || packet->decoded.request_id == 0)
+        return 0;
+
+    meshtastic_Routing routing = meshtastic_Routing_init_zero;
+    if (!pb_decode_from_bytes(packet->decoded.payload.bytes, packet->decoded.payload.size, &meshtastic_Routing_msg, &routing))
+        return 0;
+    if (routing.which_variant != meshtastic_Routing_error_reason_tag)
+        return 0;
+    PendingDeliveryEvent event;
+    event.packetId = packet->decoded.request_id;
+    event.sender = getFrom(packet);
+    event.recipient = packet->to;
+    event.error = routing.error_reason;
+    std::lock_guard<std::mutex> guard(observerInboxMutex);
+    if (observerDeliveryEvents.size() >= MAX_PENDING_DIRECT_SENDS * 2) {
+        observerDroppedEvents++;
+        return 0;
+    }
+    observerDeliveryEvents.push_back(event);
     return 0;
 }
 
@@ -1135,11 +1370,13 @@ void WdgApi::drainObserverInbox()
 {
     std::set<NodeNum> nodes;
     std::deque<PendingTextEvent> messages;
+    std::deque<PendingDeliveryEvent> deliveries;
     size_t dropped = 0;
     {
         std::lock_guard<std::mutex> guard(observerInboxMutex);
         nodes.swap(observerNodeUpdates);
         messages.swap(observerTextEvents);
+        deliveries.swap(observerDeliveryEvents);
         observerTextBytes = 0;
         dropped = observerDroppedEvents;
         observerDroppedEvents = 0;
@@ -1157,6 +1394,32 @@ void WdgApi::drainObserverInbox()
     }
     droppedEvents += dropped;
 
+    for (const PendingDeliveryEvent &delivery : deliveries) {
+        auto pending = pendingDirectSends.find(delivery.packetId);
+        if (pending == pendingDirectSends.end())
+            continue;
+        const bool remoteResult = self != 0 && delivery.sender == pending->second.destination && delivery.recipient == self;
+        const bool localRetryFailure = self != 0 && delivery.error == meshtastic_Routing_Error_MAX_RETRANSMIT &&
+                                       delivery.sender == self && delivery.recipient == self;
+        if (!remoteResult && !localRetryFailure)
+            continue;
+        const PendingDirectSend completed = pending->second;
+        pendingDirectSends.erase(pending);
+        Json::Value body(Json::objectValue);
+        body["request_id"] = completed.requestId;
+        body["packet_id"] = delivery.packetId;
+        body["destination"] = nodeId(completed.destination);
+        const bool delivered = delivery.error == meshtastic_Routing_Error_NONE;
+        body["state"] = delivered ? "delivered" : "failed";
+        if (!delivered) {
+            body["error"] = delivery.error;
+            body["detail"] = delivery.error == meshtastic_Routing_Error_MAX_RETRANSMIT
+                                 ? "Meshtastic exhausted all delivery retries"
+                                 : "Meshtastic returned a routing error";
+        }
+        enqueueEvent("send_status", body);
+    }
+
     for (const PendingTextEvent &message : messages) {
         Json::Value body(Json::objectValue);
         body["text"] = sanitizeUtf8(reinterpret_cast<const uint8_t *>(message.text.data()), message.text.size());
@@ -1170,6 +1433,26 @@ void WdgApi::drainObserverInbox()
         body["packet_id"] = message.packetId;
         if (!enqueueEvent("message", body))
             break;
+    }
+}
+
+void WdgApi::expireDirectSends()
+{
+    for (auto pending = pendingDirectSends.begin(); pending != pendingDirectSends.end();) {
+        if (!Throttle::hasElapsed(pending->second.startedMsec, DIRECT_SEND_TIMEOUT_MS)) {
+            ++pending;
+            continue;
+        }
+        const PacketId packetId = pending->first;
+        const PendingDirectSend expired = pending->second;
+        pending = pendingDirectSends.erase(pending);
+        Json::Value body(Json::objectValue);
+        body["request_id"] = expired.requestId;
+        body["packet_id"] = packetId;
+        body["destination"] = nodeId(expired.destination);
+        body["state"] = "failed";
+        body["detail"] = "Delivery status timed out after 120 seconds";
+        enqueueEvent("send_status", body);
     }
 }
 
@@ -1340,6 +1623,14 @@ void WdgApi::pollRuntimeState()
         lastFullClientOwner = fullClientOwner;
     }
 
+    Json::Value phoneBond = phoneBondJson(linuxBluetooth);
+    const std::string phoneBondState = compactJson(phoneBond);
+    if (phoneBondState != lastPhoneBondState) {
+        if (!enqueueEvent("phone_bond", phoneBond))
+            return;
+        lastPhoneBondState = phoneBondState;
+    }
+
     if (linuxBluetooth) {
         uint32_t passkey = 0;
         uint64_t token = 0;
@@ -1380,6 +1671,7 @@ void WdgApi::closeClient()
         std::lock_guard<std::mutex> guard(observerInboxMutex);
         observerNodeUpdates.clear();
         observerTextEvents.clear();
+        observerDeliveryEvents.clear();
         observerTextBytes = 0;
         observerDroppedEvents = 0;
     }
@@ -1400,9 +1692,11 @@ void WdgApi::closeClient()
     lastBleStatus.clear();
     lastRadioStatus.clear();
     lastFullClientOwner.clear();
+    lastPhoneBondState.clear();
     lastPasskeyToken = 0;
     recentRequestIds.clear();
     recentRequestIdSet.clear();
+    pendingDirectSends.clear();
 }
 
 void WdgApi::closeListener()
@@ -1426,6 +1720,7 @@ int32_t WdgApi::runOnce()
     acceptClients();
     receiveCommands();
     drainObserverInbox();
+    expireDirectSends();
     expireBluetoothLeases();
     pollRuntimeState();
     pumpSnapshot();
@@ -1433,6 +1728,40 @@ int32_t WdgApi::runOnce()
     flushReplies();
     return clientFd >= 0 || !pendingReplies.empty() ? ACTIVE_POLL_MS : IDLE_POLL_MS;
 }
+
+#ifdef PIO_UNIT_TESTING
+void WdgApi::testTrackDirectSend(PacketId packetId, const std::string &requestId, NodeNum destination, uint32_t startedMsec)
+{
+    pendingDirectSends[packetId] = PendingDirectSend{requestId, destination, startedMsec};
+}
+
+int WdgApi::testAcceptRemotePacket(const meshtastic_MeshPacket *packet)
+{
+    observerEventsEnabled.store(true, std::memory_order_release);
+    return onRemotePacketAccepted(packet);
+}
+
+void WdgApi::testDrainObserverInbox()
+{
+    drainObserverInbox();
+}
+
+void WdgApi::testExpireDirectSends()
+{
+    expireDirectSends();
+}
+
+void WdgApi::testFillCriticalReplyQueue()
+{
+    while (clientFd >= 0 && pendingReplies.size() < MAX_PENDING_REPLIES)
+        enqueueReply("{}");
+}
+
+size_t WdgApi::testPendingDirectSendCount() const
+{
+    return pendingDirectSends.size();
+}
+#endif
 
 } // namespace meshtastic::portduino
 

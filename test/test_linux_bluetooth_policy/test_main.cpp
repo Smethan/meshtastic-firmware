@@ -23,6 +23,8 @@ void setUp()
     if (!bluetooth)
         bluetooth = new LinuxBluetooth();
     bluetooth->testResetState();
+    config.bluetooth.mode = meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN;
+    bluetooth->testSetControllerAddress("02:00:00:00:00:01");
 }
 
 // PhoneAPI's process globals are intentionally minimal in this policy-only
@@ -179,6 +181,7 @@ void test_pairing_and_service_authorization_are_separate_requirements()
     bluetooth->testSetIdentityPersistenceResult(1);
     const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
     bluetooth->testSetPairingCandidate("11:22:33:44:55:66", phone, true);
+    bluetooth->testDisplayPasskey(phone);
 
     bluetooth->testSetPaired(phone, true);
     LinuxBluetooth::TestSnapshot state = bluetooth->testSnapshot();
@@ -208,9 +211,11 @@ void test_pairing_and_service_authorization_are_separate_requirements()
     TEST_ASSERT_FALSE(state.agentRegistered);
 
     bluetooth->testResetState();
+    bluetooth->testSetControllerAddress("02:00:00:00:00:01");
     bluetooth->testSetAdapter("hci2");
     bluetooth->testSetIdentityPersistenceResult(1);
     bluetooth->testSetPairingCandidate("11:22:33:44:55:66", phone, true);
+    bluetooth->testDisplayPasskey(phone);
     TEST_ASSERT_TRUE(bluetooth->testAuthorizeService(phone, MESH_SERVICE_UUID));
     TEST_ASSERT_TRUE(bluetooth->testSnapshot().bondedPhoneAddress.empty());
     TEST_ASSERT_FALSE(bluetooth->testAuthorizedPhonePath(phone));
@@ -228,6 +233,7 @@ void test_auxiliary_service_cannot_establish_a_phone_identity()
     bluetooth->testSetIdentityPersistenceResult(1);
     const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
     bluetooth->testSetPairingCandidate("11:22:33:44:55:66", phone, true);
+    bluetooth->testDisplayPasskey(phone);
     bluetooth->testSetPairingWindowState(true, true, 120000);
     bluetooth->testSetAgentRegistration(true, false);
     bluetooth->testSetPaired(phone, true);
@@ -245,6 +251,7 @@ void test_auxiliary_service_cannot_establish_a_phone_identity()
     TEST_ASSERT_FALSE(state.pairingWindowRequested);
 
     bluetooth->testResetState();
+    bluetooth->testSetControllerAddress("02:00:00:00:00:01");
     bluetooth->testSetAdapter("hci2");
     bluetooth->testSetBondIdentity("11:22:33:44:55:66", phone, true, true);
     TEST_ASSERT_TRUE(bluetooth->testAuthorizeService(phone, "0000180f-0000-1000-8000-00805f9b34fb"));
@@ -262,6 +269,7 @@ void test_identity_commit_failure_revokes_candidate_and_agent_before_activation(
     bluetooth->testSetAgentRegistration(true, false);
     const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
     bluetooth->testSetPairingCandidate("11:22:33:44:55:66", phone, true);
+    bluetooth->testDisplayPasskey(phone);
     bluetooth->testSetPaired(phone, true);
     TEST_ASSERT_TRUE(bluetooth->testAuthorizeService(phone, MESH_SERVICE_UUID));
 
@@ -560,6 +568,112 @@ void test_gatt_authorization_requires_the_persisted_paired_identity()
     TEST_ASSERT_FALSE(bluetooth->testAuthorizedPhonePath(phone));
 }
 
+void test_clear_identity_requires_the_exact_retained_address()
+{
+    bluetooth->testSetAdapter("hci2");
+    bluetooth->testSetIdentityPersistenceResult(1);
+    const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
+    bluetooth->testSetBondIdentity("11:22:33:44:55:66", phone, true, false);
+
+    TEST_ASSERT_EQUAL(LinuxBluetooth::PhoneBondActionResult::INVALID_ADDRESS, bluetooth->clearPhoneIdentity("invalid"));
+    TEST_ASSERT_EQUAL(LinuxBluetooth::PhoneBondActionResult::IDENTITY_CHANGED,
+                      bluetooth->clearPhoneIdentity("AA:BB:CC:DD:EE:FF"));
+    TEST_ASSERT_TRUE(bluetooth->getPhoneBondStatus().identityPresent);
+    TEST_ASSERT_EQUAL(LinuxBluetooth::PhoneBondActionResult::OK, bluetooth->clearPhoneIdentity("11:22:33:44:55:66"));
+    TEST_ASSERT_FALSE(bluetooth->getPhoneBondStatus().identityPresent);
+}
+
+void test_phone_bond_status_requires_paired_bonded_and_trusted()
+{
+    bluetooth->testSetAdapter("hci2");
+    const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
+    bluetooth->testAddDevice("11:22:33:44:55:66", phone, false, true);
+    bluetooth->testSetDeviceName(phone, "MeshMapper Phone");
+    LinuxBluetooth::PhoneBondStatus status = bluetooth->getPhoneBondStatus();
+    TEST_ASSERT_FALSE(status.identityPresent);
+    TEST_ASSERT_FALSE(status.adoptable);
+
+    bluetooth->testSetDeviceSecurity(phone, true, true, false);
+    status = bluetooth->getPhoneBondStatus();
+    TEST_ASSERT_FALSE(status.adoptable);
+
+    bluetooth->testSetDeviceSecurity(phone, true, true, true);
+    status = bluetooth->getPhoneBondStatus();
+    TEST_ASSERT_FALSE(status.identityPresent);
+    TEST_ASSERT_TRUE(status.adoptable);
+    TEST_ASSERT_TRUE(status.paired);
+    TEST_ASSERT_TRUE(status.bonded);
+    TEST_ASSERT_TRUE(status.trusted);
+    TEST_ASSERT_TRUE(status.connected);
+    TEST_ASSERT_EQUAL_STRING("11:22:33:44:55:66", status.address.c_str());
+    TEST_ASSERT_EQUAL_STRING("MeshMapper Phone", status.name.c_str());
+}
+
+void test_identity_authentication_provenance_is_persisted_not_inferred()
+{
+    LinuxBluetooth::PhoneBondStatus parsed;
+    TEST_ASSERT_TRUE(LinuxBluetooth::testParseIdentityRecord("11:22:33:44:55:66\n", parsed));
+    TEST_ASSERT_EQUAL_STRING("11:22:33:44:55:66", parsed.address.c_str());
+    TEST_ASSERT_TRUE(parsed.controller.empty());
+    TEST_ASSERT_EQUAL_STRING("unknown", parsed.authentication.c_str());
+
+    const std::string record = "v1\naddress=11:22:33:44:55:66\ncontroller=AA:BB:CC:DD:EE:FF\nauthentication=random_pin\n";
+    TEST_ASSERT_TRUE(LinuxBluetooth::testParseIdentityRecord(record, parsed));
+    TEST_ASSERT_EQUAL_STRING("AA:BB:CC:DD:EE:FF", parsed.controller.c_str());
+    TEST_ASSERT_EQUAL_STRING("random_pin", parsed.authentication.c_str());
+    TEST_ASSERT_FALSE(LinuxBluetooth::testParseIdentityRecord(
+        "v1\naddress=11:22:33:44:55:66\ncontroller=AA:BB:CC:DD:EE:FF\nauthentication=no_pin\n", parsed));
+
+    bluetooth->testSetAdapter("hci2");
+    const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
+    TEST_ASSERT_TRUE(bluetooth->testLoadIdentityRecord("11:22:33:44:55:66\n"));
+    bluetooth->testAddDevice("11:22:33:44:55:66", phone, true, true);
+    bluetooth->testProcessOnce();
+    TEST_ASSERT_EQUAL_STRING("unknown", bluetooth->getPhoneBondStatus().authentication.c_str());
+    TEST_ASSERT_FALSE(bluetooth->testAuthorizedPhonePath(phone));
+    TEST_ASSERT_FALSE(bluetooth->getPhoneBondStatus().authorized);
+
+    const std::string wrongController =
+        "v1\naddress=11:22:33:44:55:66\ncontroller=AA:BB:CC:DD:EE:FF\nauthentication=random_pin\n";
+    TEST_ASSERT_TRUE(bluetooth->testLoadIdentityRecord(wrongController));
+    bluetooth->testAddDevice("11:22:33:44:55:66", phone, true, true);
+    bluetooth->testProcessOnce();
+    TEST_ASSERT_FALSE(bluetooth->testAuthorizedPhonePath(phone));
+    TEST_ASSERT_FALSE(bluetooth->getPhoneBondStatus().authorized);
+
+    const std::string exactController =
+        "v1\naddress=11:22:33:44:55:66\ncontroller=02:00:00:00:00:01\nauthentication=random_pin\n";
+    TEST_ASSERT_TRUE(bluetooth->testLoadIdentityRecord(exactController));
+    bluetooth->testAddDevice("11:22:33:44:55:66", phone, true, true);
+    bluetooth->testProcessOnce();
+    TEST_ASSERT_TRUE(bluetooth->testAuthorizedPhonePath(phone));
+    TEST_ASSERT_TRUE(bluetooth->getPhoneBondStatus().authorized);
+
+    config.bluetooth.mode = meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN;
+    const LinuxBluetooth::PhoneBondStatus status = bluetooth->getPhoneBondStatus();
+    TEST_ASSERT_EQUAL_STRING("random_pin", status.authentication.c_str());
+    TEST_ASSERT_EQUAL_STRING("02:00:00:00:00:01", status.controller.c_str());
+
+    TEST_ASSERT_FALSE(bluetooth->testLoadIdentityRecord(std::string(257, 'x')));
+    TEST_ASSERT_FALSE(bluetooth->testLoadIdentityRecord(
+        "v1\naddress=11:22:33:44:55:66\ncontroller=02:00:00:00:00:01\nauthentication=random_pin"));
+}
+
+void test_pairing_candidate_requires_displayed_random_passkey_before_commit()
+{
+    bluetooth->testSetAdapter("hci2");
+    bluetooth->testSetIdentityPersistenceResult(1);
+    const std::string phone = "/org/bluez/hci2/dev_11_22_33_44_55_66";
+    bluetooth->testSetPairingCandidate("11:22:33:44:55:66", phone, true);
+    bluetooth->testSetPaired(phone, true);
+    TEST_ASSERT_TRUE(bluetooth->testAuthorizeService(phone, MESH_SERVICE_UUID));
+    bluetooth->testProcessOnce();
+    const LinuxBluetooth::TestSnapshot state = bluetooth->testSnapshot();
+    TEST_ASSERT_TRUE(state.bondedPhoneAddress.empty());
+    TEST_ASSERT_FALSE(state.pairingCandidateAuthenticated);
+    TEST_ASSERT_EQUAL_STRING(phone.c_str(), state.pairingCandidate.c_str());
+}
+
 void test_write_commit_rechecks_draining_at_the_queue_boundary()
 {
     const std::vector<uint8_t> packet{0x94, 0xc3, 0x01};
@@ -598,6 +712,10 @@ void setup()
     RUN_TEST(test_adapter_removal_targets_only_the_selected_controller);
     RUN_TEST(test_gatt_security_flags_and_blob_offsets_match_the_bluez_contract);
     RUN_TEST(test_gatt_authorization_requires_the_persisted_paired_identity);
+    RUN_TEST(test_clear_identity_requires_the_exact_retained_address);
+    RUN_TEST(test_phone_bond_status_requires_paired_bonded_and_trusted);
+    RUN_TEST(test_identity_authentication_provenance_is_persisted_not_inferred);
+    RUN_TEST(test_pairing_candidate_requires_displayed_random_passkey_before_commit);
     RUN_TEST(test_pairing_and_service_authorization_are_separate_requirements);
     RUN_TEST(test_auxiliary_service_cannot_establish_a_phone_identity);
     RUN_TEST(test_identity_commit_failure_revokes_candidate_and_agent_before_activation);

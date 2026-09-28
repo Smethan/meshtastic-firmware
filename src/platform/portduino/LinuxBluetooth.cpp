@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,15 @@ constexpr uint32_t kBluezRecoveryPollMsec = 250;
 constexpr uint32_t kBluezRecoveryInitialMsec = 1000;
 constexpr uint32_t kBluezRecoveryMaximumMsec = 30000;
 constexpr const char *kPhoneIdentityFile = "/prefs/wdg-phone-address";
+constexpr size_t kPhoneIdentityRecordMaxBytes = 256;
+constexpr const char *kRandomPinAuthentication = "random_pin";
+constexpr const char *kUnknownAuthentication = "unknown";
+
+struct StoredPhoneIdentity {
+    std::string address;
+    std::string controller;
+    std::string authentication = kUnknownAuthentication;
+};
 
 using PropertyMap = std::map<std::string, sdbus::Variant>;
 using InterfaceMap = std::map<std::string, PropertyMap>;
@@ -137,6 +147,51 @@ std::string normalizedAddress(std::string value)
     return value;
 }
 
+StoredPhoneIdentity parseStoredPhoneIdentity(std::string stored)
+{
+    StoredPhoneIdentity identity;
+    const bool versioned = stored.rfind("v1\n", 0) == 0;
+    if (versioned && (stored.empty() || stored.back() != '\n'))
+        return {};
+    while (!stored.empty() && std::isspace(static_cast<unsigned char>(stored.back())))
+        stored.pop_back();
+    if (!versioned) {
+        identity.address = normalizedAddress(stored);
+        return identity;
+    }
+
+    std::istringstream lines(stored);
+    std::string line;
+    std::getline(lines, line); // v1
+    while (std::getline(lines, line)) {
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos)
+            return {};
+        const std::string key = line.substr(0, separator);
+        const std::string value = line.substr(separator + 1);
+        if (key == "address")
+            identity.address = normalizedAddress(value);
+        else if (key == "controller")
+            identity.controller = normalizedAddress(value);
+        else if (key == "authentication")
+            identity.authentication = value;
+        else
+            return {};
+    }
+    if (identity.address.empty() || identity.controller.empty() || identity.authentication != kRandomPinAuthentication)
+        return {};
+    return identity;
+}
+
+std::string serializeStoredPhoneIdentity(const StoredPhoneIdentity &identity)
+{
+    const std::string address = normalizedAddress(identity.address);
+    const std::string controller = normalizedAddress(identity.controller);
+    if (address.empty() || controller.empty() || identity.authentication != kRandomPinAuthentication)
+        return {};
+    return "v1\naddress=" + address + "\ncontroller=" + controller + "\nauthentication=" + identity.authentication + "\n";
+}
+
 std::string addressFromPath(const std::string &path)
 {
     const size_t marker = path.rfind("/dev_");
@@ -153,6 +208,21 @@ std::string addressFromProperties(const PropertyMap &properties, const std::stri
     if (address != properties.end())
         return normalizedAddress(address->second.get<std::string>());
     return addressFromPath(path);
+}
+
+bool boolProperty(const PropertyMap &properties, const char *name)
+{
+    auto property = properties.find(name);
+    return property != properties.end() && property->second.get<bool>();
+}
+
+std::string nameFromProperties(const PropertyMap &properties)
+{
+    auto alias = properties.find("Alias");
+    if (alias != properties.end())
+        return alias->second.get<std::string>();
+    auto name = properties.find("Name");
+    return name == properties.end() ? std::string{} : name->second.get<std::string>();
 }
 
 std::string normalizedUuid(std::string uuid)
@@ -289,16 +359,25 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     std::set<std::string> physicallyConnectedDevices;
     std::set<std::string> connectedDevices;
     std::set<std::string> pairedDevices;
+    std::set<std::string> bondedDevices;
+    std::set<std::string> trustedDevices;
     std::set<std::string> serviceAuthorizedDevices;
     std::string pairingCandidate;
     bool pairingCandidateServiceAuthorized = false;
+    bool pairingCandidateAuthenticated = false;
     std::string bondedPhoneAddress;
     std::string bondedPhonePath;
+    std::string bondedPhoneController;
+    std::string bondedPhoneAuthentication = kUnknownAuthentication;
     std::map<std::string, std::string> deviceAddresses;
+    std::map<std::string, std::string> deviceNames;
     std::map<std::string, std::unique_ptr<sdbus::IProxy>> deviceProxies;
     struct PendingDeviceAdd {
         std::string address;
+        std::string name;
         bool paired = false;
+        bool bonded = false;
+        bool trusted = false;
         bool connected = false;
     };
     std::map<std::string, PendingDeviceAdd> pendingDeviceAdds;
@@ -363,6 +442,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
     // success. Tests use this to prove promotion happens strictly after the
     // cooperative identity commit without writing host preferences.
     int identityPersistenceTestResult = -1;
+    std::string controllerAddressTestValue;
 #endif
 
     // Pairing-code alert. The agent callbacks run on the event-loop thread, but
@@ -752,8 +832,11 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         const auto knownAddress = deviceAddresses.find(path);
         const std::string address =
             knownAddress == deviceAddresses.end() || knownAddress->second.empty() ? addressFromPath(path) : knownAddress->second;
+        const std::string controller = currentControllerAddress();
         return belongsToAdapter(path) && !bondedPhoneAddress.empty() && address == bondedPhoneAddress &&
-               pairedDevices.count(path) != 0;
+               bondedPhoneAuthentication == kRandomPinAuthentication && !controller.empty() &&
+               bondedPhoneController == controller && pairedDevices.count(path) != 0 && bondedDevices.count(path) != 0 &&
+               trustedDevices.count(path) != 0;
     }
 
     bool authorizedPhonePath(const std::string &path)
@@ -988,6 +1071,19 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         concurrency::mainDelay.interrupt();
     }
 
+    std::string currentControllerAddress() const
+    {
+#ifdef PIO_UNIT_TESTING
+        if (!controllerAddressTestValue.empty())
+            return normalizedAddress(controllerAddressTestValue);
+#endif
+#ifdef MESHTASTIC_WDG_API
+        return normalizedAddress(meshtastic::portduino::selectedWdgBluetoothAdapterAddress());
+#else
+        return {};
+#endif
+    }
+
     void loadPhoneIdentity()
     {
         if (phoneIdentityLoaded)
@@ -995,40 +1091,54 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         phoneIdentityLoaded = true;
 
         std::string stored;
+        bool oversized = false;
         {
             concurrency::LockGuard guard(spiLock);
             auto file = FSCom.open(kPhoneIdentityFile, FILE_O_READ);
             if (file) {
                 int value;
-                while ((value = file.read()) >= 0 && stored.size() < 32)
+                while ((value = file.read()) >= 0) {
+                    if (stored.size() >= kPhoneIdentityRecordMaxBytes) {
+                        oversized = true;
+                        break;
+                    }
                     stored.push_back(static_cast<char>(value));
+                }
                 file.close();
             }
         }
-        while (!stored.empty() && std::isspace(static_cast<unsigned char>(stored.back())))
-            stored.pop_back();
-        stored = normalizedAddress(stored);
-        if (!stored.empty()) {
+        if (oversized) {
+            LOG_ERROR("BLE ignored an oversized Meshtastic phone identity record");
+            return;
+        }
+        const StoredPhoneIdentity identity = parseStoredPhoneIdentity(stored);
+        if (!identity.address.empty()) {
             std::lock_guard<std::mutex> guard(devMutex);
-            bondedPhoneAddress = stored;
-            LOG_INFO("BLE loaded Meshtastic phone identity %s", stored.c_str());
+            bondedPhoneAddress = identity.address;
+            bondedPhoneController = identity.controller;
+            bondedPhoneAuthentication = identity.authentication;
+            LOG_INFO("BLE loaded Meshtastic phone identity %s (%s)", identity.address.c_str(), identity.authentication.c_str());
+        } else if (!stored.empty()) {
+            LOG_ERROR("BLE ignored an invalid Meshtastic phone identity record");
         }
     }
 
-    bool writePhoneIdentity(const std::string &address)
+    bool writePhoneIdentity(const std::string &address, const std::string &controller, const std::string &authentication)
     {
 #ifdef PIO_UNIT_TESTING
         if (identityPersistenceTestResult >= 0)
             return identityPersistenceTestResult != 0;
 #endif
+        const std::string record = serializeStoredPhoneIdentity({address, controller, authentication});
+        if (record.empty())
+            return false;
         {
             concurrency::LockGuard guard(spiLock);
             FSCom.mkdir("/prefs");
         }
         SafeFile file(kPhoneIdentityFile, true);
-        const size_t expected = address.size() + 1;
-        const size_t written = file.write(reinterpret_cast<const uint8_t *>(address.c_str()), address.size()) + file.write('\n');
-        return written == expected && file.close();
+        const size_t written = file.write(reinterpret_cast<const uint8_t *>(record.data()), record.size());
+        return written == record.size() && file.close();
     }
 
     bool clearPhoneIdentityFile()
@@ -1079,6 +1189,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 serviceAuthorizedDevices.erase(bondedPhonePath);
                 bondedPhoneAddress.clear();
                 bondedPhonePath.clear();
+                bondedPhoneController.clear();
+                bondedPhoneAuthentication = kUnknownAuthentication;
             }
             deviceStatePending = true;
             return true;
@@ -1087,7 +1199,9 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         if (address.empty())
             return true;
 
-        if (!writePhoneIdentity(address)) {
+        const std::string controller = currentControllerAddress();
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN || controller.empty() ||
+            !writePhoneIdentity(address, controller, kRandomPinAuthentication)) {
             LOG_ERROR("BLE could not persist the Meshtastic phone identity; will retry");
             {
                 std::lock_guard<std::mutex> guard(identityMutex);
@@ -1097,6 +1211,11 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 }
             }
             return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            bondedPhoneController = controller;
+            bondedPhoneAuthentication = kRandomPinAuthentication;
         }
         LOG_INFO("BLE saved Meshtastic phone identity %s", address.c_str());
         return true;
@@ -1120,6 +1239,30 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         pendingPhoneIdentityAddress.clear();
     }
 
+    bool ensureDeviceTrusted(const std::string &path)
+    {
+        sdbus::IProxy *proxy = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (trustedDevices.count(path) != 0)
+                return true;
+            auto known = deviceProxies.find(path);
+            if (known != deviceProxies.end())
+                proxy = known->second.get();
+        }
+        if (!proxy)
+            return false;
+        try {
+            proxy->setProperty("Trusted").onInterface(kIfaceDevice).toValue(true);
+        } catch (const sdbus::Error &e) {
+            LOG_ERROR("BLE could not trust the authenticated phone: %s", e.getMessage().c_str());
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(devMutex);
+        trustedDevices.insert(path);
+        return true;
+    }
+
     void failPairingCandidate(const std::string &path, bool removeBond)
     {
         {
@@ -1127,6 +1270,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             if (pairingCandidate == path) {
                 pairingCandidate.clear();
                 pairingCandidateServiceAuthorized = false;
+                pairingCandidateAuthenticated = false;
             }
             serviceAuthorizedDevices.erase(path);
         }
@@ -1149,8 +1293,9 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 if (pairingCandidate.empty())
                     return;
                 expiredPath = pairingCandidate;
-            } else if (pairingCandidate.empty() || !pairingCandidateServiceAuthorized ||
-                       pairedDevices.count(pairingCandidate) == 0 || phoneIdentityClearPending.load()) {
+            } else if (pairingCandidate.empty() || !pairingCandidateServiceAuthorized || !pairingCandidateAuthenticated ||
+                       pairedDevices.count(pairingCandidate) == 0 || bondedDevices.count(pairingCandidate) == 0 ||
+                       phoneIdentityClearPending.load()) {
                 return;
             }
             path = expiredPath.empty() ? pairingCandidate : expiredPath;
@@ -1164,8 +1309,19 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             return;
         }
 
-        if (address.empty() || !writePhoneIdentity(address)) {
+        const std::string controller = currentControllerAddress();
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN || address.empty() ||
+            controller.empty() || !writePhoneIdentity(address, controller, kRandomPinAuthentication)) {
             LOG_ERROR("BLE could not commit the new phone identity; rejecting the incomplete bond");
+            failPairingCandidate(path, true);
+            return;
+        }
+
+        // Persist the exact identity before granting BlueZ trust or internal
+        // GATT authorization. A failure rolls the incomplete bond back.
+        if (!ensureDeviceTrusted(path)) {
+            if (!clearPhoneIdentityFile())
+                requestPhoneIdentityClear();
             failPairingCandidate(path, true);
             return;
         }
@@ -1178,12 +1334,16 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                                                    ? addressFromPath(path)
                                                    : knownAddress->second;
             if (pairingWindowAcceptingCallbacks() && pairingCandidate == path && pairingCandidateServiceAuthorized &&
-                pairedDevices.count(path) != 0 && currentAddress == address && !phoneIdentityClearPending.load()) {
+                pairingCandidateAuthenticated && pairedDevices.count(path) != 0 && bondedDevices.count(path) != 0 &&
+                trustedDevices.count(path) != 0 && currentAddress == address && !phoneIdentityClearPending.load()) {
                 bondedPhoneAddress = address;
                 bondedPhonePath = path;
+                bondedPhoneController = controller;
+                bondedPhoneAuthentication = kRandomPinAuthentication;
                 serviceAuthorizedDevices.insert(path);
                 pairingCandidate.clear();
                 pairingCandidateServiceAuthorized = false;
+                pairingCandidateAuthenticated = false;
                 promoted = true;
             }
         }
@@ -1256,6 +1416,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             if ((address == deviceAddresses.end() || address->second.empty()) && addressFromPath(path).empty())
                 return false;
             pairingCandidate = path;
+            pairingCandidateAuthenticated = false;
         }
         return true;
     }
@@ -1308,8 +1469,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         bool accepted = false;
         {
             std::lock_guard<std::mutex> guard(devMutex);
-            const bool paired = pairedDevices.count(path) != 0;
-            const bool storedPhone = paired && isBondedPhoneLocked(path);
+            const bool storedPhone = isBondedPhoneLocked(path);
             const bool pendingPhone = pairingWindowAcceptingCallbacks() && pairingCandidate == path;
             if (storedPhone) {
                 // Auxiliary services, including Battery, may only follow an
@@ -1351,9 +1511,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             std::lock_guard<std::mutex> guard(devMutex);
             if (pairedNow) {
                 pairedDevices.insert(path);
-                const auto knownAddress = deviceAddresses.find(path);
-                const std::string address = knownAddress == deviceAddresses.end() ? addressFromPath(path) : knownAddress->second;
-                if (!bondedPhoneAddress.empty() && address == bondedPhoneAddress) {
+                if (isBondedPhoneLocked(path)) {
                     bondedPhonePath = path;
                     serviceAuthorizedDevices.insert(path);
                 }
@@ -1375,7 +1533,50 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         wakeMainLoop();
     }
 
-    void trackDevice(const std::string &path, const std::string &address, bool pairedNow)
+    void onDeviceBondedChanged(const std::string &path, bool bondedNow)
+    {
+        bool clearIdentity = false;
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (bondedNow) {
+                bondedDevices.insert(path);
+                if (isBondedPhoneLocked(path)) {
+                    bondedPhonePath = path;
+                    serviceAuthorizedDevices.insert(path);
+                }
+            } else {
+                bondedDevices.erase(path);
+                serviceAuthorizedDevices.erase(path);
+                clearIdentity = path == bondedPhonePath;
+            }
+        }
+        if (clearIdentity)
+            requestPhoneIdentityClear();
+        deviceStatePending = true;
+        wakeMainLoop();
+    }
+
+    void onDeviceTrustedChanged(const std::string &path, bool trustedNow)
+    {
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (trustedNow) {
+                trustedDevices.insert(path);
+                if (isBondedPhoneLocked(path)) {
+                    bondedPhonePath = path;
+                    serviceAuthorizedDevices.insert(path);
+                }
+            } else {
+                trustedDevices.erase(path);
+                serviceAuthorizedDevices.erase(path);
+            }
+        }
+        deviceStatePending = true;
+        wakeMainLoop();
+    }
+
+    void trackDevice(const std::string &path, const std::string &address, const std::string &name, bool pairedNow, bool bondedNow,
+                     bool trustedNow)
     {
         // LOCK ORDER: devMutex must stay a leaf on the main thread (the event-loop
         // thread takes it inside its dispatch lock), so the proxy - a D-Bus
@@ -1383,11 +1584,20 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         {
             std::lock_guard<std::mutex> guard(devMutex);
             deviceAddresses[path] = address;
+            deviceNames[path] = name;
             if (pairedNow)
                 pairedDevices.insert(path);
             else
                 pairedDevices.erase(path);
-            if (pairedNow && !bondedPhoneAddress.empty() && address == bondedPhoneAddress) {
+            if (bondedNow)
+                bondedDevices.insert(path);
+            else
+                bondedDevices.erase(path);
+            if (trustedNow)
+                trustedDevices.insert(path);
+            else
+                trustedDevices.erase(path);
+            if (isBondedPhoneLocked(path)) {
                 bondedPhonePath = path;
                 // The durable identity and BlueZ bond are the reconnect
                 // authorization. No default Agent1 registration is needed (or
@@ -1406,6 +1616,22 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 auto paired = changed.find("Paired");
                 if (paired != changed.end())
                     onDevicePairedChanged(path, paired->second.get<bool>());
+                auto bonded = changed.find("Bonded");
+                if (bonded != changed.end())
+                    onDeviceBondedChanged(path, bonded->second.get<bool>());
+                auto trusted = changed.find("Trusted");
+                if (trusted != changed.end())
+                    onDeviceTrustedChanged(path, trusted->second.get<bool>());
+                auto alias = changed.find("Alias");
+                auto deviceName = changed.find("Name");
+                if (alias != changed.end() || deviceName != changed.end()) {
+                    {
+                        std::lock_guard<std::mutex> guard(devMutex);
+                        deviceNames[path] = (alias != changed.end() ? alias : deviceName)->second.get<std::string>();
+                    }
+                    deviceStatePending = true;
+                    wakeMainLoop();
+                }
                 auto it = changed.find("Connected");
                 if (it != changed.end())
                     onDeviceConnectedChanged(path, it->second.get<bool>());
@@ -1431,7 +1657,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         for (const auto &[path, device] : additions) {
             if (removals.count(path) != 0)
                 continue;
-            trackDevice(path, device.address, device.paired);
+            trackDevice(path, device.address, device.name, device.paired, device.bonded, device.trusted);
             onDeviceConnectedChanged(path, device.connected);
         }
 
@@ -1448,8 +1674,11 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 pendingDeviceAdds.erase(path);
                 physicallyConnectedDevices.erase(path);
                 pairedDevices.erase(path);
+                bondedDevices.erase(path);
+                trustedDevices.erase(path);
                 serviceAuthorizedDevices.erase(path);
                 deviceAddresses.erase(path);
+                deviceNames.erase(path);
                 // InterfacesRemoved also occurs during bluetoothd/controller
                 // teardown and cache churn.  Retire this transient object path
                 // without forgetting the durable bonded address; Paired=false
@@ -1537,18 +1766,15 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         auto it = interfaces.find(kIfaceDevice);
         if (it == interfaces.end() || !belongsToAdapter(path))
             return;
-        bool connectedNow = false;
-        bool pairedNow = false;
-        auto prop = it->second.find("Connected");
-        if (prop != it->second.end())
-            connectedNow = prop->second.get<bool>();
-        prop = it->second.find("Paired");
-        if (prop != it->second.end())
-            pairedNow = prop->second.get<bool>();
+        const bool connectedNow = boolProperty(it->second, "Connected");
+        const bool pairedNow = boolProperty(it->second, "Paired");
+        const bool bondedNow = boolProperty(it->second, "Bonded");
+        const bool trustedNow = boolProperty(it->second, "Trusted");
         const std::string address = addressFromProperties(it->second, path);
+        const std::string name = nameFromProperties(it->second);
         {
             std::lock_guard<std::mutex> guard(devMutex);
-            pendingDeviceAdds[path] = PendingDeviceAdd{address, pairedNow, connectedNow};
+            pendingDeviceAdds[path] = PendingDeviceAdd{address, name, pairedNow, bondedNow, trustedNow, connectedNow};
         }
         deviceStatePending = true;
         wakeMainLoop();
@@ -1587,10 +1813,18 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
 
     void onDisplayPasskey(const sdbus::ObjectPath &device, uint32_t passkey, uint16_t entered)
     {
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN)
+            throw sdbuscompat::dbusError("org.bluez.Error.Rejected", "random passkey pairing is not configured");
         requirePairingDevice(device);
         if (entered > 0)
             return; // progress updates while the peer types; the code is already
                     // showing
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (pairingCandidate != device)
+                throw sdbuscompat::dbusError("org.bluez.Error.Rejected", "pairing candidate changed");
+            pairingCandidateAuthenticated = true;
+        }
         pendingPasskey = passkey;
         passkeyChangeToken.fetch_add(1, std::memory_order_release);
         passkeyAvailable.store(true, std::memory_order_release);
@@ -1606,6 +1840,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             candidate = pairingCandidate;
             pairingCandidate.clear();
             pairingCandidateServiceAuthorized = false;
+            pairingCandidateAuthenticated = false;
         }
         if (!candidate.empty()) {
             std::lock_guard<std::mutex> guard(policyMutex);
@@ -1673,7 +1908,8 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
 
     bool openPairingWindowPolicy(uint32_t seconds)
     {
-        if (!enabled || pairingAgentSuspended || seconds == 0 || hasBondedPhone())
+        if (!enabled || pairingAgentSuspended || seconds == 0 || hasBondedPhone() ||
+            config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN)
             return false;
 
         seconds = std::min(seconds, LinuxBluetooth::MAX_PAIRING_WINDOW_SECONDS);
@@ -1714,6 +1950,7 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 unpairedCandidate = pairingCandidate;
                 pairingCandidate.clear();
                 pairingCandidateServiceAuthorized = false;
+                pairingCandidateAuthenticated = false;
             }
         }
         if (!unpairedCandidate.empty()) {
@@ -1929,16 +2166,12 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
                 auto dev = entry.second.find(kIfaceDevice);
                 if (dev == entry.second.end() || !belongsToAdapter(entry.first))
                     continue;
-                bool connectedNow = false;
-                auto prop = dev->second.find("Connected");
-                if (prop != dev->second.end())
-                    connectedNow = prop->second.get<bool>();
-                bool pairedNow = false;
-                prop = dev->second.find("Paired");
-                if (prop != dev->second.end())
-                    pairedNow = prop->second.get<bool>();
+                const bool connectedNow = boolProperty(dev->second, "Connected");
+                const bool pairedNow = boolProperty(dev->second, "Paired");
+                const bool bondedNow = boolProperty(dev->second, "Bonded");
+                const bool trustedNow = boolProperty(dev->second, "Trusted");
                 const std::string address = addressFromProperties(dev->second, entry.first);
-                trackDevice(entry.first, address, pairedNow);
+                trackDevice(entry.first, address, nameFromProperties(dev->second), pairedNow, bondedNow, trustedNow);
                 if (connectedNow)
                     onDeviceConnectedChanged(entry.first, true);
             }
@@ -2335,13 +2568,17 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             physicallyConnectedDevices.clear();
             connectedDevices.clear();
             pairedDevices.clear();
+            bondedDevices.clear();
+            trustedDevices.clear();
             serviceAuthorizedDevices.clear();
             deviceAddresses.clear();
+            deviceNames.clear();
             pendingDeviceAdds.clear();
             pendingDeviceRemovals.clear();
             bondedPhonePath.clear();
             pairingCandidate.clear();
             pairingCandidateServiceAuthorized = false;
+            pairingCandidateAuthenticated = false;
         }
         doomed.clear();
         {
@@ -2390,6 +2627,192 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
         batteryNotifying = false;
         batteryAvailable = false;
         bluezLostPending = false;
+    }
+
+    LinuxBluetooth::PhoneBondStatus phoneBondStatus()
+    {
+        LinuxBluetooth::PhoneBondStatus status;
+        std::lock_guard<std::mutex> guard(devMutex);
+        status.identityPresent = !bondedPhoneAddress.empty();
+        status.controller = bondedPhoneController;
+        status.authentication = bondedPhoneAuthentication;
+        std::vector<std::string> candidates;
+        if (status.identityPresent) {
+            status.address = bondedPhoneAddress;
+            for (const auto &[path, address] : deviceAddresses)
+                if (address == bondedPhoneAddress)
+                    candidates.push_back(path);
+        } else {
+            for (const auto &[path, address] : deviceAddresses)
+                if (belongsToAdapter(path) && !address.empty() && pairedDevices.count(path) != 0 &&
+                    bondedDevices.count(path) != 0 && trustedDevices.count(path) != 0)
+                    candidates.push_back(path);
+            status.adoptable = candidates.size() == 1;
+        }
+        status.ambiguous = candidates.size() > 1;
+        if (candidates.size() != 1)
+            return status;
+        const std::string &path = candidates.front();
+        if (!status.identityPresent)
+            status.address = deviceAddresses[path];
+        auto name = deviceNames.find(path);
+        if (name != deviceNames.end())
+            status.name = name->second;
+        status.paired = pairedDevices.count(path) != 0;
+        status.bonded = bondedDevices.count(path) != 0;
+        status.trusted = trustedDevices.count(path) != 0;
+        status.connected = physicallyConnectedDevices.count(path) != 0;
+        status.authorized = serviceAuthorizedDevices.count(path) != 0 && isBondedPhoneLocked(path);
+        return status;
+    }
+
+    struct AdoptionCandidate {
+        std::string path;
+        std::string address;
+        std::string name;
+        bool paired = false;
+        bool bonded = false;
+        bool trusted = false;
+        bool connected = false;
+    };
+
+    LinuxBluetooth::PhoneBondActionResult inspectAdoptionCandidate(const std::string &requestedAddress,
+                                                                   const std::string &requestedController,
+                                                                   AdoptionCandidate &candidate)
+    {
+        ManagedObjects objects;
+        bluezRootProxy->callMethod("GetManagedObjects").onInterface(kIfaceObjectManager).storeResultsTo(objects);
+        auto selectedAdapter = objects.find(sdbus::ObjectPath{adapterPath});
+        if (selectedAdapter == objects.end())
+            return LinuxBluetooth::PhoneBondActionResult::INVALID_CONTROLLER;
+        auto adapter = selectedAdapter->second.find(kIfaceAdapter);
+        if (adapter == selectedAdapter->second.end())
+            return LinuxBluetooth::PhoneBondActionResult::INVALID_CONTROLLER;
+        auto addressProperty = adapter->second.find("Address");
+        if (addressProperty == adapter->second.end() ||
+            normalizedAddress(addressProperty->second.get<std::string>()) != requestedController)
+            return LinuxBluetooth::PhoneBondActionResult::INVALID_CONTROLLER;
+        std::vector<AdoptionCandidate> eligible;
+        size_t matchingAddressCount = 0;
+        std::vector<std::string> connectedPaths;
+        for (const auto &entry : objects) {
+            auto dev = entry.second.find(kIfaceDevice);
+            if (dev == entry.second.end() || !belongsToAdapter(entry.first))
+                continue;
+            AdoptionCandidate current;
+            current.path = entry.first;
+            current.address = addressFromProperties(dev->second, entry.first);
+            current.name = nameFromProperties(dev->second);
+            current.paired = boolProperty(dev->second, "Paired");
+            current.bonded = boolProperty(dev->second, "Bonded");
+            current.trusted = boolProperty(dev->second, "Trusted");
+            current.connected = boolProperty(dev->second, "Connected");
+            if (current.connected)
+                connectedPaths.push_back(current.path);
+            if (!requestedAddress.empty() && current.address == requestedAddress) {
+                matchingAddressCount++;
+                eligible.push_back(current);
+            } else if (requestedAddress.empty() && current.paired && current.bonded && current.trusted) {
+                eligible.push_back(current);
+            }
+        }
+        if ((!requestedAddress.empty() && matchingAddressCount == 0) || eligible.empty())
+            return LinuxBluetooth::PhoneBondActionResult::NOT_FOUND;
+        if (eligible.size() != 1 || (!requestedAddress.empty() && matchingAddressCount != 1))
+            return LinuxBluetooth::PhoneBondActionResult::AMBIGUOUS;
+        candidate = eligible.front();
+        if (!candidate.paired || !candidate.bonded || !candidate.trusted)
+            return LinuxBluetooth::PhoneBondActionResult::NOT_SECURE;
+        for (const std::string &path : connectedPaths)
+            if (path != candidate.path)
+                return LinuxBluetooth::PhoneBondActionResult::FOREIGN_CONNECTED;
+        return LinuxBluetooth::PhoneBondActionResult::OK;
+    }
+
+    LinuxBluetooth::PhoneBondActionResult doAdoptPhoneBond(const std::string &requested, const std::string &controller)
+    {
+        if (!enabled || !conn || !bluezRootProxy)
+            return LinuxBluetooth::PhoneBondActionResult::UNAVAILABLE;
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN)
+            return LinuxBluetooth::PhoneBondActionResult::NOT_SECURE;
+        if (!persistPhoneIdentityIfNeeded())
+            return LinuxBluetooth::PhoneBondActionResult::PERSISTENCE_FAILED;
+        const std::string requestedAddress = normalizedAddress(requested);
+        const std::string requestedController = normalizedAddress(controller);
+        if (requestedAddress.empty())
+            return LinuxBluetooth::PhoneBondActionResult::INVALID_ADDRESS;
+        if (requestedController.empty())
+            return LinuxBluetooth::PhoneBondActionResult::INVALID_CONTROLLER;
+        closePairingWindowPolicy(true);
+        AdoptionCandidate candidate;
+        try {
+            auto result = inspectAdoptionCandidate(requestedAddress, requestedController, candidate);
+            if (result != LinuxBluetooth::PhoneBondActionResult::OK)
+                return result;
+        } catch (const sdbus::Error &e) {
+            LOG_ERROR("BLE could not inspect phone bonds: %s", e.getMessage().c_str());
+            return LinuxBluetooth::PhoneBondActionResult::UNAVAILABLE;
+        }
+        bool identityWriteRequired = true;
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (!bondedPhoneAddress.empty() && bondedPhoneAddress != candidate.address)
+                return LinuxBluetooth::PhoneBondActionResult::IDENTITY_CONFLICT;
+            identityWriteRequired = bondedPhoneAddress != candidate.address || bondedPhoneController != requestedController ||
+                                    bondedPhoneAuthentication != kRandomPinAuthentication;
+        }
+
+        AdoptionCandidate verified;
+        LinuxBluetooth::PhoneBondActionResult verification = LinuxBluetooth::PhoneBondActionResult::UNAVAILABLE;
+        try {
+            verification = inspectAdoptionCandidate(candidate.address, requestedController, verified);
+        } catch (const sdbus::Error &e) {
+            LOG_ERROR("BLE could not verify adopted phone bond: %s", e.getMessage().c_str());
+        }
+        if (verification != LinuxBluetooth::PhoneBondActionResult::OK || verified.path != candidate.path) {
+            return verification == LinuxBluetooth::PhoneBondActionResult::OK ? LinuxBluetooth::PhoneBondActionResult::AMBIGUOUS
+                                                                             : verification;
+        }
+        // Both snapshots agreed before durable state changes. SafeFile keeps an
+        // existing identity intact if this replacement cannot be committed.
+        if (identityWriteRequired && !writePhoneIdentity(verified.address, requestedController, kRandomPinAuthentication))
+            return LinuxBluetooth::PhoneBondActionResult::PERSISTENCE_FAILED;
+        trackDevice(verified.path, verified.address, verified.name, verified.paired, verified.bonded, verified.trusted);
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            bondedPhoneAddress = verified.address;
+            bondedPhonePath = verified.path;
+            bondedPhoneController = requestedController;
+            bondedPhoneAuthentication = kRandomPinAuthentication;
+            serviceAuthorizedDevices.insert(verified.path);
+            if (verified.connected)
+                physicallyConnectedDevices.insert(verified.path);
+            pairingCandidate.clear();
+            pairingCandidateServiceAuthorized = false;
+            pairingCandidateAuthenticated = false;
+        }
+        reconcilePhoneConnection();
+        deviceStatePending = true;
+        LOG_INFO("BLE adopted authenticated phone identity %s", verified.address.c_str());
+        return LinuxBluetooth::PhoneBondActionResult::OK;
+    }
+
+    LinuxBluetooth::PhoneBondActionResult doClearPhoneIdentity(const std::string &expected)
+    {
+        const std::string expectedAddress = normalizedAddress(expected);
+        if (expectedAddress.empty())
+            return LinuxBluetooth::PhoneBondActionResult::INVALID_ADDRESS;
+        {
+            std::lock_guard<std::mutex> guard(devMutex);
+            if (bondedPhoneAddress != expectedAddress)
+                return LinuxBluetooth::PhoneBondActionResult::IDENTITY_CHANGED;
+            if (!bondedPhonePath.empty() && physicallyConnectedDevices.count(bondedPhonePath) != 0)
+                return LinuxBluetooth::PhoneBondActionResult::CONNECTED;
+        }
+        requestPhoneIdentityClear();
+        if (!persistPhoneIdentityIfNeeded())
+            return LinuxBluetooth::PhoneBondActionResult::PERSISTENCE_FAILED;
+        return LinuxBluetooth::PhoneBondActionResult::OK;
     }
 
     bool doClearBonds()
@@ -2443,7 +2866,11 @@ struct LinuxBluetooth::Impl final : public PhoneAPI, public concurrency::OSThrea
             std::lock_guard<std::mutex> guard(devMutex);
             bondedPhoneAddress.clear();
             bondedPhonePath.clear();
+            bondedPhoneController.clear();
+            bondedPhoneAuthentication = kUnknownAuthentication;
             pairingCandidate.clear();
+            pairingCandidateServiceAuthorized = false;
+            pairingCandidateAuthenticated = false;
             connectedDevices.erase(phonePath);
             serviceAuthorizedDevices.erase(phonePath);
         }
@@ -2551,6 +2978,21 @@ bool LinuxBluetooth::hasBondedPhone() const
     return impl->hasBondedPhone();
 }
 
+LinuxBluetooth::PhoneBondStatus LinuxBluetooth::getPhoneBondStatus() const
+{
+    return impl->phoneBondStatus();
+}
+
+LinuxBluetooth::PhoneBondActionResult LinuxBluetooth::adoptPhoneBond(const std::string &address, const std::string &controller)
+{
+    return impl->doAdoptPhoneBond(address, controller);
+}
+
+LinuxBluetooth::PhoneBondActionResult LinuxBluetooth::clearPhoneIdentity(const std::string &expectedAddress)
+{
+    return impl->doClearPhoneIdentity(expectedAddress);
+}
+
 bool LinuxBluetooth::getLatestPasskey(uint32_t &passkey, uint64_t &changeToken) const
 {
     return impl->getLatestPasskey(passkey, changeToken);
@@ -2635,19 +3077,26 @@ void LinuxBluetooth::testResetState()
     impl->batteryNotifying = false;
     impl->configQueueOverflowPending = false;
     impl->identityPersistenceTestResult = -1;
+    impl->controllerAddressTestValue.clear();
     {
         std::lock_guard<std::mutex> guard(impl->devMutex);
         impl->physicallyConnectedDevices.clear();
         impl->connectedDevices.clear();
         impl->pairedDevices.clear();
+        impl->bondedDevices.clear();
+        impl->trustedDevices.clear();
         impl->serviceAuthorizedDevices.clear();
         impl->deviceAddresses.clear();
+        impl->deviceNames.clear();
         impl->pendingDeviceAdds.clear();
         impl->pendingDeviceRemovals.clear();
         impl->bondedPhoneAddress.clear();
         impl->bondedPhonePath.clear();
+        impl->bondedPhoneController.clear();
+        impl->bondedPhoneAuthentication = kUnknownAuthentication;
         impl->pairingCandidate.clear();
         impl->pairingCandidateServiceAuthorized = false;
+        impl->pairingCandidateAuthenticated = false;
     }
     {
         std::lock_guard<std::mutex> guard(impl->policyMutex);
@@ -2704,8 +3153,14 @@ LinuxBluetooth::TestSnapshot LinuxBluetooth::testSnapshot() const
         std::lock_guard<std::mutex> guard(impl->devMutex);
         snapshot.bondedPhoneAddress = impl->bondedPhoneAddress;
         snapshot.bondedPhonePath = impl->bondedPhonePath;
+        snapshot.bondedPhoneController = impl->bondedPhoneController;
+        snapshot.bondedPhoneAuthentication = impl->bondedPhoneAuthentication;
+        auto phoneName = impl->deviceNames.find(impl->bondedPhonePath);
+        if (phoneName != impl->deviceNames.end())
+            snapshot.bondedPhoneName = phoneName->second;
         snapshot.pairingCandidate = impl->pairingCandidate;
         snapshot.pairingCandidateServiceAuthorized = impl->pairingCandidateServiceAuthorized;
+        snapshot.pairingCandidateAuthenticated = impl->pairingCandidateAuthenticated;
         snapshot.serviceAuthorizedDevices = impl->serviceAuthorizedDevices.size();
         snapshot.connectedDevices = impl->connectedDevices.size();
         snapshot.pendingDeviceRemovals = impl->pendingDeviceRemovals.size();
@@ -2732,6 +3187,11 @@ void LinuxBluetooth::testSetAdapter(const std::string &adapter)
 {
     impl->adapterId = adapter;
     impl->adapterPath = "/org/bluez/" + adapter;
+}
+
+void LinuxBluetooth::testSetControllerAddress(const std::string &controller)
+{
+    impl->controllerAddressTestValue = normalizedAddress(controller);
 }
 
 void LinuxBluetooth::testInjectBluezOwnerChange(const std::string &oldOwner, const std::string &newOwner)
@@ -2781,17 +3241,27 @@ void LinuxBluetooth::testSetBondIdentity(const std::string &address, const std::
     if (paired) {
         impl->bondedPhoneAddress = normalized;
         impl->bondedPhonePath = path;
+        impl->bondedPhoneController = impl->currentControllerAddress();
+        impl->bondedPhoneAuthentication = kRandomPinAuthentication;
         impl->pairedDevices.insert(path);
+        impl->bondedDevices.insert(path);
+        impl->trustedDevices.insert(path);
         impl->serviceAuthorizedDevices.insert(path);
         impl->pairingCandidate.clear();
         impl->pairingCandidateServiceAuthorized = false;
+        impl->pairingCandidateAuthenticated = false;
     } else {
         impl->bondedPhoneAddress.clear();
         impl->bondedPhonePath.clear();
+        impl->bondedPhoneController.clear();
+        impl->bondedPhoneAuthentication = kUnknownAuthentication;
         impl->pairedDevices.erase(path);
+        impl->bondedDevices.erase(path);
+        impl->trustedDevices.erase(path);
         impl->serviceAuthorizedDevices.erase(path);
         impl->pairingCandidate = path;
         impl->pairingCandidateServiceAuthorized = false;
+        impl->pairingCandidateAuthenticated = false;
     }
     if (connected) {
         impl->physicallyConnectedDevices.insert(path);
@@ -2817,11 +3287,16 @@ void LinuxBluetooth::testSetPairingCandidate(const std::string &address, const s
     impl->deviceAddresses[path] = normalized;
     impl->bondedPhoneAddress.clear();
     impl->bondedPhonePath.clear();
+    impl->bondedPhoneController.clear();
+    impl->bondedPhoneAuthentication = kUnknownAuthentication;
     impl->pairedDevices.erase(path);
+    impl->bondedDevices.erase(path);
+    impl->trustedDevices.erase(path);
     impl->serviceAuthorizedDevices.erase(path);
     impl->connectedDevices.erase(path);
     impl->pairingCandidate = path;
     impl->pairingCandidateServiceAuthorized = false;
+    impl->pairingCandidateAuthenticated = false;
     impl->pairingWindowStartedMsec = Time::getMillis();
     impl->pairingWindowDurationMsec = LinuxBluetooth::MAX_PAIRING_WINDOW_SECONDS * 1000U;
     impl->armPairingWindowAuthorization();
@@ -2830,6 +3305,52 @@ void LinuxBluetooth::testSetPairingCandidate(const std::string &address, const s
         impl->physicallyConnectedDevices.insert(path);
     else
         impl->physicallyConnectedDevices.erase(path);
+}
+
+void LinuxBluetooth::testDisplayPasskey(const std::string &path, uint32_t passkey)
+{
+    impl->onDisplayPasskey(sdbus::ObjectPath{path}, passkey, 0);
+}
+
+void LinuxBluetooth::testSetBondProvenance(const std::string &controller, const std::string &authentication)
+{
+    std::lock_guard<std::mutex> guard(impl->devMutex);
+    impl->bondedPhoneController = normalizedAddress(controller);
+    impl->bondedPhoneAuthentication = authentication == kRandomPinAuthentication ? authentication : kUnknownAuthentication;
+}
+
+bool LinuxBluetooth::testParseIdentityRecord(const std::string &record, PhoneBondStatus &status)
+{
+    const StoredPhoneIdentity identity = parseStoredPhoneIdentity(record);
+    status = {};
+    status.identityPresent = !identity.address.empty();
+    status.address = identity.address;
+    status.controller = identity.controller;
+    status.authentication = identity.authentication;
+    return status.identityPresent;
+}
+
+bool LinuxBluetooth::testLoadIdentityRecord(const std::string &record)
+{
+    {
+        concurrency::LockGuard guard(spiLock);
+        FSCom.mkdir("/prefs");
+    }
+    SafeFile file(kPhoneIdentityFile, true);
+    if (file.write(reinterpret_cast<const uint8_t *>(record.data()), record.size()) != record.size() || !file.close())
+        return false;
+    {
+        std::lock_guard<std::mutex> guard(impl->devMutex);
+        impl->bondedPhoneAddress.clear();
+        impl->bondedPhonePath.clear();
+        impl->bondedPhoneController.clear();
+        impl->bondedPhoneAuthentication = kUnknownAuthentication;
+    }
+    impl->phoneIdentityLoaded = false;
+    impl->loadPhoneIdentity();
+    const bool present = impl->phoneBondStatus().identityPresent;
+    impl->clearPhoneIdentityFile();
+    return present;
 }
 
 bool LinuxBluetooth::testClaimPairingDevice(const std::string &path)
@@ -2844,12 +3365,16 @@ void LinuxBluetooth::testAddDevice(const std::string &address, const std::string
     impl->deviceAddresses[path] = normalized;
     if (paired) {
         impl->pairedDevices.insert(path);
-        if (!impl->bondedPhoneAddress.empty() && normalized == impl->bondedPhoneAddress) {
+        impl->bondedDevices.insert(path);
+        impl->trustedDevices.insert(path);
+        if (impl->isBondedPhoneLocked(path)) {
             impl->bondedPhonePath = path;
             impl->serviceAuthorizedDevices.insert(path);
         }
     } else {
         impl->pairedDevices.erase(path);
+        impl->bondedDevices.erase(path);
+        impl->trustedDevices.erase(path);
     }
     if (connected)
         impl->physicallyConnectedDevices.insert(path);
@@ -2860,7 +3385,22 @@ void LinuxBluetooth::testAddDevice(const std::string &address, const std::string
 
 void LinuxBluetooth::testSetPaired(const std::string &path, bool paired)
 {
+    impl->onDeviceBondedChanged(path, paired);
+    impl->onDeviceTrustedChanged(path, paired);
     impl->onDevicePairedChanged(path, paired);
+}
+
+void LinuxBluetooth::testSetDeviceSecurity(const std::string &path, bool paired, bool bonded, bool trusted)
+{
+    impl->onDeviceBondedChanged(path, bonded);
+    impl->onDeviceTrustedChanged(path, trusted);
+    impl->onDevicePairedChanged(path, paired);
+}
+
+void LinuxBluetooth::testSetDeviceName(const std::string &path, const std::string &name)
+{
+    std::lock_guard<std::mutex> guard(impl->devMutex);
+    impl->deviceNames[path] = name;
 }
 
 bool LinuxBluetooth::testAuthorizeService(const std::string &path, const std::string &uuid)

@@ -15,8 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#ifdef PIO_UNIT_TESTING
 #include <string>
+#ifdef PIO_UNIT_TESTING
 #include <vector>
 #endif
 
@@ -37,6 +37,36 @@ class LinuxBluetooth
 {
   public:
     static constexpr uint32_t MAX_PAIRING_WINDOW_SECONDS = 120;
+
+    struct PhoneBondStatus {
+        bool identityPresent = false;
+        bool adoptable = false;
+        bool ambiguous = false;
+        bool paired = false;
+        bool bonded = false;
+        bool trusted = false;
+        bool connected = false;
+        bool authorized = false;
+        std::string address;
+        std::string name;
+        std::string controller;
+        std::string authentication = "unknown";
+    };
+
+    enum class PhoneBondActionResult : uint8_t {
+        OK,
+        UNAVAILABLE,
+        INVALID_ADDRESS,
+        INVALID_CONTROLLER,
+        NOT_FOUND,
+        AMBIGUOUS,
+        NOT_SECURE,
+        FOREIGN_CONNECTED,
+        IDENTITY_CONFLICT,
+        IDENTITY_CHANGED,
+        PERSISTENCE_FAILED,
+        CONNECTED,
+    };
 
     LinuxBluetooth();
     ~LinuxBluetooth();
@@ -70,6 +100,9 @@ class LinuxBluetooth
     void closePairingWindow();
     bool isPairingWindowOpen() const;
     bool hasBondedPhone() const;
+    PhoneBondStatus getPhoneBondStatus() const;
+    PhoneBondActionResult adoptPhoneBond(const std::string &address, const std::string &controller);
+    PhoneBondActionResult clearPhoneIdentity(const std::string &expectedAddress);
     /// Return the active pairing passkey and its monotonic change token.
     bool getLatestPasskey(uint32_t &passkey, uint64_t &changeToken) const;
 
@@ -116,6 +149,7 @@ class LinuxBluetooth
         size_t serviceAuthorizedDevices = 0;
         size_t connectedDevices = 0;
         bool pairingCandidateServiceAuthorized = false;
+        bool pairingCandidateAuthenticated = false;
         bool pairingWindowRequested = false;
         bool pairingAgentNeeded = false;
         size_t sessionResetCount = 0;
@@ -127,6 +161,9 @@ class LinuxBluetooth
         std::string adapterId;
         std::string bondedPhoneAddress;
         std::string bondedPhonePath;
+        std::string bondedPhoneName;
+        std::string bondedPhoneController;
+        std::string bondedPhoneAuthentication;
         std::string pairingCandidate;
         std::string pendingIdentityAddress;
     };
@@ -138,6 +175,7 @@ class LinuxBluetooth
     TestSnapshot testSnapshot() const;
     void testSetEnabled(bool enabled);
     void testSetAdapter(const std::string &adapter);
+    void testSetControllerAddress(const std::string &controller);
     void testInjectBluezOwnerChange(const std::string &oldOwner, const std::string &newOwner);
     void testBeginApplicationRegistration(uint64_t generation);
     void testCompleteApplicationRegistration(uint64_t generation, bool failed);
@@ -148,8 +186,14 @@ class LinuxBluetooth
     void testSetBondIdentity(const std::string &address, const std::string &path, bool paired, bool connected);
     void testAddDevice(const std::string &address, const std::string &path, bool paired, bool connected);
     void testSetPairingCandidate(const std::string &address, const std::string &path, bool connected);
+    void testDisplayPasskey(const std::string &path, uint32_t passkey = 123456);
+    void testSetBondProvenance(const std::string &controller, const std::string &authentication);
+    static bool testParseIdentityRecord(const std::string &record, PhoneBondStatus &status);
+    bool testLoadIdentityRecord(const std::string &record);
     bool testClaimPairingDevice(const std::string &path);
     void testSetPaired(const std::string &path, bool paired);
+    void testSetDeviceSecurity(const std::string &path, bool paired, bool bonded, bool trusted);
+    void testSetDeviceName(const std::string &path, const std::string &name);
     bool testAuthorizeService(const std::string &path, const std::string &uuid);
     bool testAuthorizedPhonePath(const std::string &path);
     void testSetIdentityPersistenceResult(int result);
