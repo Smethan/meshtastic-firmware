@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BUILD="$ROOT/packaging/wdg/build-deb.sh"
 SERVICE="$ROOT/packaging/wdg/meshtasticd-wdg.service"
+MANAGER_SERVICE="$ROOT/packaging/wdg/watchdogs-sx1262d.service"
 POSTINST="$ROOT/packaging/wdg/postinst"
 TMPFILES="$ROOT/packaging/wdg/meshtasticd-wdg.tmpfiles"
 VERIFY_ASSETS="$ROOT/packaging/wdg/verify-tested-assets.sh"
@@ -11,11 +12,17 @@ VERIFY_ASSETS="$ROOT/packaging/wdg/verify-tested-assets.sh"
 bash -n "$BUILD" "$POSTINST" "$VERIFY_ASSETS"
 grep -q '^umask 022$' "$BUILD"
 grep -q '^Conflicts=meshtasticd.service$' "$SERVICE"
-grep -q 'flock -n -E 75 /run/lock/watchdogs/aio-sx1262.lock' "$SERVICE"
+grep -q '^Requires=watchdogs-sx1262d.service$' "$SERVICE"
+if grep -q 'aio-sx1262.lock' "$SERVICE"; then
+	echo "Meshtastic service still takes the legacy radio lock" >&2
+	exit 1
+fi
 grep -q '^AmbientCapabilities=CAP_NET_BIND_SERVICE$' "$SERVICE"
 grep -q '^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$' "$SERVICE"
 grep -q -- '--fsdir=/var/lib/meshtasticd/.portduino/default$' "$SERVICE"
-grep -q '^RestartPreventExitStatus=75$' "$SERVICE"
+grep -q '^RestrictAddressFamilies=AF_UNIX$' "$MANAGER_SERVICE"
+grep -q '^DevicePolicy=closed$' "$MANAGER_SERVICE"
+grep -q -- '--sx1262-manager' "$MANAGER_SERVICE"
 grep -q 'Smethan/meshtastic-firmware' "$BUILD"
 grep -q 'Package: meshtasticd-wdg' "$BUILD"
 grep -q 'Architecture: arm64' "$BUILD"
@@ -30,8 +37,7 @@ grep -q '"libsdbus-c++2"' "$BUILD"
 grep -q '"liborcania2.3"' "$BUILD"
 grep -q '"libulfius2.7t64"' "$BUILD"
 grep -q '"libyaml-cpp0.8"' "$BUILD"
-grep -qx 'd /run/lock/watchdogs 2750 root watchdogs -' "$TMPFILES"
-grep -qx 'f /run/lock/watchdogs/aio-sx1262.lock 0660 root watchdogs -' "$TMPFILES"
+grep -qx 'd /run/watchdogs 0770 watchdogs-sx1262d watchdogs -' "$TMPFILES"
 
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT

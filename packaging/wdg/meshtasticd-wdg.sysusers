@@ -2,6 +2,8 @@ g watchdogs -
 g spi -
 g gpio -
 u meshtasticd - "Meshtastic daemon" /var/lib/meshtasticd /usr/sbin/nologin
+u watchdogs-sx1262d - "WatchDogsGo SX1262 manager" /var/lib/watchdogs /usr/sbin/nologin
 m meshtasticd watchdogs
-m meshtasticd spi
-m meshtasticd gpio
+m watchdogs-sx1262d watchdogs
+m watchdogs-sx1262d spi
+m watchdogs-sx1262d gpio

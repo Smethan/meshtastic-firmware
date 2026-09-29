@@ -41,6 +41,7 @@
 extern LinuxBluetooth *linuxBluetooth; // defined in main.cpp
 #endif
 #ifdef MESHTASTIC_WDG_API
+#include "platform/portduino/SX1262Broker.h"
 #include "platform/portduino/WdgPolicy.h"
 #endif
 
@@ -77,6 +78,10 @@ char *optionMac = nullptr;
 bool verboseEnabled = false;
 bool yamlOnly = false;
 bool configCheck = false;
+#ifdef MESHTASTIC_WDG_API
+bool sx1262ManagerMode = false;
+bool sx1262ManagerFakeRadio = false;
+#endif
 // Every config file we attempted to load, in load order, for --check to report on.
 std::vector<std::string> attemptedConfigFiles;
 
@@ -148,6 +153,10 @@ bool checkConfigPort = true;
 // Long-only option: argp treats any key above the printable ASCII range as having no
 // single-character equivalent.
 #define OPT_CONFIG_CHECK 1001
+#ifdef MESHTASTIC_WDG_API
+#define OPT_SX1262_MANAGER 1003
+#define OPT_SX1262_MANAGER_FAKE 1004
+#endif
 #ifdef _WIN32
 #define OPT_SERVICE 1002
 #endif
@@ -158,6 +167,15 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
     case OPT_CONFIG_CHECK:
         configCheck = true;
         break;
+#ifdef MESHTASTIC_WDG_API
+    case OPT_SX1262_MANAGER:
+        sx1262ManagerMode = true;
+        break;
+    case OPT_SX1262_MANAGER_FAKE:
+        sx1262ManagerMode = true;
+        sx1262ManagerFakeRadio = true;
+        break;
+#endif
     case 'p':
         if (sscanf(arg, "%d", &TCPPort) < 1) {
             return ARGP_ERR_UNKNOWN;
@@ -242,6 +260,10 @@ void portduinoCustomInit()
         {"verbose", 'v', 0, 0, "Set log level to full debug"},
         {"output-yaml", 'y', 0, 0, "Output config yaml and exit"},
         {"check", OPT_CONFIG_CHECK, 0, 0, "Check the configuration for problems, print a report, and exit"},
+#ifdef MESHTASTIC_WDG_API
+        {"sx1262-manager", OPT_SX1262_MANAGER, 0, 0, "Run the WatchDogsGo SX1262 manager"},
+        {"sx1262-manager-fake", OPT_SX1262_MANAGER_FAKE, 0, OPTION_HIDDEN, "Run the SX1262 manager with a fake radio"},
+#endif
 #ifdef _WIN32
         {"service", OPT_SERVICE, 0, 0, "Run as a Windows service"},
 #endif
@@ -785,9 +807,10 @@ void portduinoSetup()
         }
     }
 
-    getMacAddr(dmac);
+    if (!sx1262ManagerMode)
+        getMacAddr(dmac);
 #ifndef PIO_UNIT_TESTING
-    if (dmac[0] == 0 && dmac[1] == 0 && dmac[2] == 0 && dmac[3] == 0 && dmac[4] == 0 && dmac[5] == 0) {
+    if (!sx1262ManagerMode && dmac[0] == 0 && dmac[1] == 0 && dmac[2] == 0 && dmac[3] == 0 && dmac[4] == 0 && dmac[5] == 0) {
         std::cout << "*** Blank MAC Address not allowed!" << std::endl;
         std::cout << "Please set a MAC Address in config.yaml using either MACAddress or MACAddressSource." << std::endl;
         exit(EXIT_FAILURE);
@@ -822,7 +845,8 @@ void portduinoSetup()
     for (const auto *i : portduino_config.all_pins) {
         // In the case of a ch341 Lora device, we don't want to touch the system GPIO lines for Lora
         // Those GPIO are handled in our usermode driver instead.
-        if (i->config_section == "Lora" && portduino_config.lora_spi_dev == "ch341") {
+        if (i->config_section == "Lora" &&
+            (portduino_config.lora_spi_dev == "ch341" || portduino_config.lora_module == use_broker)) {
             continue;
         }
         if (i->enabled) {
@@ -841,7 +865,8 @@ void portduinoSetup()
     for (auto i : portduino_config.extra_pins) {
         // In the case of a ch341 Lora device, we don't want to touch the system GPIO lines for Lora
         // Those GPIO are handled in our usermode driver instead.
-        if (i.config_section == "Lora" && portduino_config.lora_spi_dev == "ch341") {
+        if (i.config_section == "Lora" &&
+            (portduino_config.lora_spi_dev == "ch341" || portduino_config.lora_module == use_broker)) {
             continue;
         }
         if (i.enabled) {
@@ -888,7 +913,8 @@ void portduinoSetup()
     for (auto i : portduino_config.extra_pins) {
         // In the case of a ch341 Lora device, we don't want to touch the system GPIO lines for Lora
         // Those GPIO are handled in our usermode driver instead.
-        if (i.config_section == "Lora" && portduino_config.lora_spi_dev == "ch341") {
+        if (i.config_section == "Lora" &&
+            (portduino_config.lora_spi_dev == "ch341" || portduino_config.lora_module == use_broker)) {
             continue;
         }
         if (i.enabled && i.default_high) {
@@ -898,9 +924,20 @@ void portduinoSetup()
     }
 
     // Only initialize the radio pins when dealing with real, kernel controlled SPI hardware
-    if (portduino_config.lora_spi_dev != "" && portduino_config.lora_spi_dev != "ch341") {
+    if (portduino_config.lora_module != use_broker && portduino_config.lora_module != use_simradio &&
+        portduino_config.lora_spi_dev != "" && portduino_config.lora_spi_dev != "ch341") {
         SPI.begin(portduino_config.lora_spi_dev.c_str());
     }
+
+#ifdef MESHTASTIC_WDG_API
+    if (sx1262ManagerMode) {
+        const char *testSocket = sx1262ManagerFakeRadio ? getenv("WATCHDOGS_SX1262_SOCKET") : nullptr;
+        const char *testState = sx1262ManagerFakeRadio ? getenv("WATCHDOGS_SX1262_FORCED_OFF") : nullptr;
+        exit(meshtastic::portduino::runSX1262Broker(testSocket ? testSocket : "/run/watchdogs/sx1262d.sock",
+                                                    testState ? testState : "/var/lib/watchdogs/sx1262-forced-off",
+                                                    sx1262ManagerFakeRadio));
+    }
+#endif
 
     if (portduino_config.traceFilename != "") {
         try {
@@ -1095,6 +1132,7 @@ bool loadConfig(const char *configPath)
             }
 
             portduino_config.spiSpeed = yamlConfig["Lora"]["spiSpeed"].as<int>(2000000);
+            portduino_config.broker_socket = yamlConfig["Lora"]["BrokerSocket"].as<std::string>("/run/watchdogs/sx1262d.sock");
             portduino_config.lora_usb_serial_num = yamlConfig["Lora"]["USB_Serialnum"].as<std::string>("");
             portduino_config.lora_usb_pid = yamlConfig["Lora"]["USB_PID"].as<int>(0x5512);
             portduino_config.lora_usb_vid = yamlConfig["Lora"]["USB_VID"].as<int>(0x1A86);

@@ -52,6 +52,7 @@ STAGE="$WORK/stage"
 mkdir -p \
 	"$STAGE/DEBIAN" \
 	"$STAGE/usr/lib/meshtasticd-wdg" \
+	"$STAGE/usr/lib/watchdogs-sx1262d" \
 	"$STAGE/usr/lib/systemd/system" \
 	"$STAGE/usr/lib/tmpfiles.d" \
 	"$STAGE/usr/lib/sysusers.d" \
@@ -60,8 +61,11 @@ mkdir -p \
 	"$STAGE/usr/share/doc/meshtasticd-wdg"
 
 install -m 0755 "$BINARY" "$STAGE/usr/lib/meshtasticd-wdg/meshtasticd"
+install -m 0755 "$BINARY" "$STAGE/usr/lib/watchdogs-sx1262d/watchdogs-sx1262d"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.service" \
 	"$STAGE/usr/lib/systemd/system/meshtasticd-wdg.service"
+install -m 0644 "$ROOT/packaging/wdg/watchdogs-sx1262d.service" \
+	"$STAGE/usr/lib/systemd/system/watchdogs-sx1262d.service"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.tmpfiles" \
 	"$STAGE/usr/lib/tmpfiles.d/meshtasticd-wdg.conf"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.sysusers" \
@@ -70,6 +74,8 @@ install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg-dbus.conf" \
 	"$STAGE/usr/share/dbus-1/system.d/meshtasticd-wdg.conf"
 install -m 0644 "$ROOT/packaging/wdg/wdg-portduino.example.yaml" \
 	"$STAGE/usr/share/meshtasticd-wdg/wdg-portduino.example.yaml"
+install -m 0644 "$ROOT/packaging/wdg/sx1262.example.yaml" \
+	"$STAGE/usr/share/meshtasticd-wdg/sx1262.example.yaml"
 install -m 0644 "$ROOT/packaging/wdg/copyright" \
 	"$STAGE/usr/share/doc/meshtasticd-wdg/copyright"
 install -m 0644 "$ROOT/UPSTREAM_BASE" \
@@ -150,6 +156,7 @@ print(json.dumps({
     "source_ref": source_ref,
     "license": "GPL-3.0-only",
     "wdg_api": {"major": 1, "minor": 1},
+    "sx1262_broker_api": {"major": 1, "minor": 0},
     "package": {
         "name": "meshtasticd-wdg",
         "version": version,
@@ -183,6 +190,7 @@ print(json.dumps({
     "source_ref": source_ref,
     "license": "GPL-3.0-only",
     "wdg_api": {"major": 1, "minor": 1},
+    "sx1262_broker_api": {"major": 1, "minor": 0},
     "package": {
         "name": "meshtasticd-wdg",
         "version": version,

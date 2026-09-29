@@ -1,0 +1,19 @@
+# Hardware facts only. setup.sh generates /etc/watchdogs/sx1262.yaml from the
+# validated AIO board mapping and never places protocol/channel state here.
+Lora:
+  Module: sx1262
+  # Portduino prefixes /dev/; do not put an absolute path here.
+  spidev: spidev1.0
+  spiSpeed: 7800000
+  # setup.sh resolves the actual gpiochip/line mapping on CM4 versus CM5.
+  gpiochip: 0
+  IRQ: 26
+  Busy: 24
+  Reset: 25
+  Enable_Pins:
+    - pin: 16
+      line: 16
+      default_high: true
+  DIO2_AS_RF_SWITCH: true
+  DIO3_TCXO_VOLTAGE: 1.8
+  SX126X_MAX_POWER: 22

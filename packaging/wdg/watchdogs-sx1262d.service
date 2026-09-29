@@ -1,0 +1,48 @@
+[Unit]
+Description=WatchDogsGo single-owner SX1262 manager
+Before=meshtasticd-wdg.service
+After=local-fs.target
+StartLimitIntervalSec=200
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=watchdogs-sx1262d
+Group=watchdogs
+SupplementaryGroups=spi gpio
+RuntimeDirectory=watchdogs
+RuntimeDirectoryMode=0770
+StateDirectory=watchdogs
+StateDirectoryMode=0750
+UMask=0007
+ExecStartPre=/usr/bin/test -r /etc/watchdogs/sx1262.yaml
+ExecStart=/usr/lib/watchdogs-sx1262d/watchdogs-sx1262d --sx1262-manager --config=/etc/watchdogs/sx1262.yaml --fsdir=/var/lib/watchdogs/portduino
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/run/watchdogs /var/lib/watchdogs
+DevicePolicy=closed
+DeviceAllow=/dev/spidev1.0 rw
+DeviceAllow=/dev/gpiochip0 rw
+DeviceAllow=/dev/gpiochip1 rw
+DeviceAllow=/dev/gpiochip2 rw
+DeviceAllow=/dev/gpiochip3 rw
+DeviceAllow=/dev/gpiochip4 rw
+
+[Install]
+WantedBy=multi-user.target

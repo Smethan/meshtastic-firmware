@@ -25,6 +25,9 @@
 #include <string.h>
 
 #ifdef ARCH_PORTDUINO
+#if defined(MESHTASTIC_WDG_API) && defined(__linux__)
+#include "platform/portduino/BrokerRadioInterface.h"
+#endif
 #include "platform/portduino/PortduinoGlue.h"
 #include "platform/portduino/SimRadio.h"
 #include "platform/portduino/USBHal.h"
@@ -385,6 +388,10 @@ std::unique_ptr<RadioInterface> initLoRa()
     auto loraModuleInterface = [](LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                                   RADIOLIB_PIN_TYPE busy) {
         switch (portduino_config.lora_module) {
+#if defined(MESHTASTIC_WDG_API) && defined(__linux__)
+        case use_broker:
+            return std::unique_ptr<RadioInterface>(new BrokerRadioInterface(portduino_config.broker_socket));
+#endif
         case use_rf95:
             return std::unique_ptr<RadioInterface>(new RF95Interface(hal, cs, irq, rst, busy));
         case use_sx1262:
@@ -413,7 +420,9 @@ std::unique_ptr<RadioInterface> initLoRa()
 
     LOG_DEBUG("Activate %s radio on SPI port %s", portduino_config.loraModules[portduino_config.lora_module].c_str(),
               portduino_config.lora_spi_dev.c_str());
-    if (portduino_config.lora_spi_dev == "ch341") {
+    if (portduino_config.lora_module == use_broker) {
+        rIf = loraModuleInterface(nullptr, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC);
+    } else if (portduino_config.lora_spi_dev == "ch341") {
         RadioLibHAL = ch341Hal.get(); // non-owning: the ch341 HAL stays owned by the global unique_ptr
     } else {
         if (RadioLibHAL != nullptr) {
@@ -422,9 +431,10 @@ std::unique_ptr<RadioInterface> initLoRa()
         }
         RadioLibHAL = new LockingArduinoHal(SPI, loraSpiSettings);
     }
-    rIf =
-        loraModuleInterface((LockingArduinoHal *)RadioLibHAL, portduino_config.lora_cs_pin.pin, portduino_config.lora_irq_pin.pin,
-                            portduino_config.lora_reset_pin.pin, portduino_config.lora_busy_pin.pin);
+    if (!rIf)
+        rIf = loraModuleInterface((LockingArduinoHal *)RadioLibHAL, portduino_config.lora_cs_pin.pin,
+                                  portduino_config.lora_irq_pin.pin, portduino_config.lora_reset_pin.pin,
+                                  portduino_config.lora_busy_pin.pin);
 
     if (!rIf->init()) {
         LOG_WARN("No %s radio", portduino_config.loraModules[portduino_config.lora_module].c_str());

@@ -18,6 +18,15 @@ configure | reconfigure)
 		chown root:meshtasticd "$policy"
 		chmod 0640 "$policy"
 	fi
+	manager_config=/etc/watchdogs/sx1262.yaml
+	if [ -e "$manager_config" ] || [ -L "$manager_config" ]; then
+		if [ ! -f "$manager_config" ] || [ -L "$manager_config" ]; then
+			echo "Unsafe SX1262 manager config: $manager_config" >&2
+			exit 1
+		fi
+		chown root:watchdogs "$manager_config"
+		chmod 0640 "$manager_config"
+	fi
 	if command -v systemctl >/dev/null 2>&1; then
 		systemctl daemon-reload >/dev/null 2>&1 || true
 	fi
