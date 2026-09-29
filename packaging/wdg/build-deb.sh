@@ -61,7 +61,8 @@ mkdir -p \
 	"$STAGE/usr/share/doc/meshtasticd-wdg"
 
 install -m 0755 "$BINARY" "$STAGE/usr/lib/meshtasticd-wdg/meshtasticd"
-install -m 0755 "$BINARY" "$STAGE/usr/lib/watchdogs-sx1262d/watchdogs-sx1262d"
+install -m 0755 "$ROOT/packaging/wdg/watchdogs-sx1262d" \
+	"$STAGE/usr/lib/watchdogs-sx1262d/watchdogs-sx1262d"
 install -m 0644 "$ROOT/packaging/wdg/meshtasticd-wdg.service" \
 	"$STAGE/usr/lib/systemd/system/meshtasticd-wdg.service"
 install -m 0644 "$ROOT/packaging/wdg/watchdogs-sx1262d.service" \
