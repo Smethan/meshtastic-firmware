@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import socket
 import subprocess
 import sys
@@ -54,10 +55,70 @@ def request(sock: socket.socket, generation: int, request_id: int,
             return reply
 
 
+def test_role_authentication(binary: Path) -> None:
+    """Exercise distinct NSS lookups; getpwnam storage may be reused."""
+    with tempfile.TemporaryDirectory(prefix="sx1262-broker-auth-") as temporary:
+        root = Path(temporary)
+        config = root / "sx1262.yaml"
+        config.write_text("Lora:\n  Module: sim\n", encoding="utf-8")
+        sock_path = root / "sx1262d.sock"
+        current = pwd.getpwuid(os.getuid())
+        manager = next(
+            pwd.getpwnam(name) for name in ("root", "nobody")
+            if pwd.getpwnam(name).pw_uid != current.pw_uid)
+        environment = os.environ.copy()
+        environment["WATCHDOGS_SX1262_SOCKET"] = str(sock_path)
+        environment["WATCHDOGS_SX1262_FORCED_OFF"] = str(root / "forced-off")
+        environment["WATCHDOGS_SX1262_TEST_MESHTASTIC_USER"] = current.pw_name
+        environment["WATCHDOGS_SX1262_TEST_MANAGER_USER"] = manager.pw_name
+        process = subprocess.Popen(
+            [str(binary), "--sx1262-manager-fake", f"--config={config}",
+             f"--fsdir={root / 'fs'}"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not sock_path.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError(process.stdout.read())
+                time.sleep(0.02)
+            assert sock_path.exists(), "credential-test broker socket was not created"
+
+            meshtastic, _generation = hello(sock_path, "meshtastic")
+            meshtastic.close()
+
+            disallowed = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            disallowed.settimeout(5)
+            disallowed.connect(str(sock_path))
+            send(disallowed, {
+                "type": "hello", "request_id": 2,
+                "api": {"major": 1, "minor": 0}, "role": "controller",
+            })
+            rejected = receive(disallowed)
+            assert not rejected["ok"], rejected
+            assert rejected["error"]["code"] == "unauthorized_role", rejected
+            disallowed.close()
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        output = process.stdout.read()
+        assert process.returncode == 0, (
+            f"credential-test broker exited with status {process.returncode}:\n{output}"
+        )
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test-sx1262-broker.py MESHTASTICD_BINARY")
     binary = Path(sys.argv[1]).resolve()
+    test_role_authentication(binary)
     with tempfile.TemporaryDirectory(prefix="sx1262-broker-") as temporary:
         root = Path(temporary)
         config = root / "sx1262.yaml"

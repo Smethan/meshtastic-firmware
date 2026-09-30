@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <poll.h>
 #include <pwd.h>
 #include <string>
@@ -116,6 +117,16 @@ bool decodeBase64(const std::string &input, std::vector<uint8_t> &output)
             output.push_back(static_cast<uint8_t>(value));
     }
     return output.size() <= SX1262_BROKER_MAX_PAYLOAD;
+}
+
+std::optional<uid_t> accountUid(const std::string &name)
+{
+    // getpwnam() may return a pointer to storage reused by the next NSS
+    // lookup. Copy the UID before looking up another account.
+    const passwd *account = getpwnam(name.c_str());
+    if (!account)
+        return std::nullopt;
+    return account->pw_uid;
 }
 
 enum class Mode { OFF, STARTING, MESHTASTIC, MESHCORE, RETICULUM, TRANSITION, FAULT };
@@ -344,9 +355,10 @@ struct Client {
 class Broker
 {
   public:
-    Broker(std::unique_ptr<RadioBackend> radio, std::string socketPath, std::string forcedOffPath, bool enforceRoles)
+    Broker(std::unique_ptr<RadioBackend> radio, std::string socketPath, std::string forcedOffPath, bool enforceRoles,
+           std::string meshtasticUser = "meshtasticd", std::string managerUser = "watchdogs-sx1262d")
         : radio(std::move(radio)), socketPath(std::move(socketPath)), forcedOffPath(std::move(forcedOffPath)),
-          enforceRoles(enforceRoles)
+          enforceRoles(enforceRoles), meshtasticUser(std::move(meshtasticUser)), managerUser(std::move(managerUser))
     {
     }
 
@@ -498,10 +510,10 @@ class Broker
             sendError(client, requestId, "invalid_role", "Unknown broker client role");
             return;
         }
-        const passwd *meshtasticAccount = getpwnam("meshtasticd");
-        const passwd *managerAccount = getpwnam("watchdogs-sx1262d");
-        const bool isMeshtastic = meshtasticAccount && client.uid == meshtasticAccount->pw_uid;
-        const bool isManager = managerAccount && client.uid == managerAccount->pw_uid;
+        const std::optional<uid_t> meshtasticUid = accountUid(meshtasticUser);
+        const std::optional<uid_t> managerUid = accountUid(managerUser);
+        const bool isMeshtastic = meshtasticUid && client.uid == *meshtasticUid;
+        const bool isManager = managerUid && client.uid == *managerUid;
         if (enforceRoles && ((role == "meshtastic" && !isMeshtastic) || (role != "meshtastic" && (isMeshtastic || isManager)))) {
             sendError(client, requestId, "unauthorized_role", "Peer credentials do not permit this broker role");
             return;
@@ -1030,6 +1042,8 @@ class Broker
     uint64_t txPackets = 0;
     uint64_t faults = 0;
     bool enforceRoles = true;
+    std::string meshtasticUser;
+    std::string managerUser;
 };
 
 } // namespace
@@ -1043,7 +1057,12 @@ int runSX1262Broker(const char *socketPath, const char *forcedOffPath, bool fake
         radio = std::make_unique<FakeRadioBackend>();
     else
         radio = std::make_unique<RadioLibSX1262Backend>();
-    Broker broker(std::move(radio), socketPath, forcedOffPath, !fakeRadio);
+    const char *testMeshtasticUser = fakeRadio ? getenv("WATCHDOGS_SX1262_TEST_MESHTASTIC_USER") : nullptr;
+    const char *testManagerUser = fakeRadio ? getenv("WATCHDOGS_SX1262_TEST_MANAGER_USER") : nullptr;
+    const bool enforceRoles = !fakeRadio || (testMeshtasticUser && testManagerUser);
+    Broker broker(std::move(radio), socketPath, forcedOffPath, enforceRoles,
+                  testMeshtasticUser ? testMeshtasticUser : "meshtasticd",
+                  testManagerUser ? testManagerUser : "watchdogs-sx1262d");
     return broker.run();
 }
 
