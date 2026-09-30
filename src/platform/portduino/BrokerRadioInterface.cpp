@@ -328,6 +328,12 @@ bool BrokerRadioInterface::request(const char *operation, const Json::Value &arg
 
 bool BrokerRadioInterface::configureBroker()
 {
+    // Match SX126xInterface::programModemParams(): regional configuration can
+    // request more power than the physical SX1262 supports (US defaults to
+    // 30 dBm, while the AIO radio is bounded to 22 dBm).  The hardware broker
+    // correctly rejects out-of-range PHY requests, so clamp on the protocol
+    // side before serializing the configuration.
+    limitPower(portduino_config.sx126x_max_power);
     Json::Value arguments(Json::objectValue);
     Json::Value &phy = arguments["phy"];
     phy["frequency"] = Json::UInt64(static_cast<uint64_t>(std::llround(savedFreq * 1000000.0)));
