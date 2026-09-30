@@ -110,6 +110,9 @@ jobs:
             wdg-native-${{ runner.os }}-
       - name: Build ${{ matrix.environment }}
         run: pio run -e ${{ matrix.environment }}
+      - name: SX1262 broker conformance
+        if: matrix.environment == 'native-wdg'
+        run: ./bin/test-sx1262-broker.py .pio/build/native-wdg/meshtasticd
       - name: Validate simulated candidate config loading
         if: matrix.environment == 'native-wdg'
         run: ./bin/test-sim-config.sh .pio/build/native-wdg/meshtasticd

@@ -15,6 +15,7 @@
 #include <Utility.h>
 #include <assert.h>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -933,9 +934,10 @@ void portduinoSetup()
     if (sx1262ManagerMode) {
         const char *testSocket = sx1262ManagerFakeRadio ? getenv("WATCHDOGS_SX1262_SOCKET") : nullptr;
         const char *testState = sx1262ManagerFakeRadio ? getenv("WATCHDOGS_SX1262_FORCED_OFF") : nullptr;
-        exit(meshtastic::portduino::runSX1262Broker(testSocket ? testSocket : "/run/watchdogs/sx1262d.sock",
-                                                    testState ? testState : "/var/lib/watchdogs/sx1262-forced-off",
-                                                    sx1262ManagerFakeRadio));
+        const int status = meshtastic::portduino::runSX1262Broker(testSocket ? testSocket : "/run/watchdogs/sx1262d.sock",
+                                                                  testState ? testState : "/var/lib/watchdogs/sx1262-forced-off",
+                                                                  sx1262ManagerFakeRadio);
+        std::_Exit(status);
     }
 #endif
 

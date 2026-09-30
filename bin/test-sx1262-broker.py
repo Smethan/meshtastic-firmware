@@ -135,6 +135,10 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        output = process.stdout.read()
+        assert process.returncode == 0, (
+            f"broker exited with status {process.returncode}:\n{output}"
+        )
     print("SX1262 broker conformance checks passed")
     return 0
 

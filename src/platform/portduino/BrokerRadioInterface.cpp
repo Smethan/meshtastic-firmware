@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
@@ -121,7 +122,11 @@ bool BrokerRadioInterface::init()
 {
     if (!RadioInterface::init())
         return false;
-    if (!connectBroker()) {
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!connectBroker() && std::chrono::steady_clock::now() < deadline)
+        usleep(100000);
+    if (socketFd < 0) {
         LOG_ERROR("SX1262 manager unavailable at %s", socketPath.c_str());
         return false;
     }
