@@ -986,7 +986,11 @@ void setup()
     SPI.begin(false);
 #endif // HW_SPI1_DEVICE
 #elif ARCH_PORTDUINO
-    if (portduino_config.lora_spi_dev != "ch341") {
+    // Broker and simulated radios do not own a kernel SPI device.  In
+    // particular, a broker client must not even probe the Portduino default
+    // (/dev/spidev0.0): the SX1262 manager is the sole SPI owner.
+    if (portduino_config.lora_module != use_broker && portduino_config.lora_module != use_simradio &&
+        !portduino_config.lora_spi_dev.empty() && portduino_config.lora_spi_dev != "ch341") {
         SPI.begin();
     }
 #elif !defined(ARCH_ESP32) // ARCH_RP2040

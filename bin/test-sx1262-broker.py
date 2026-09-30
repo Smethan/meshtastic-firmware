@@ -203,6 +203,8 @@ def test_meshtastic_broker_startup(binary: Path) -> None:
         assert "Final Tx power: 22 dBm" in daemon_output, daemon_output
         assert "broker init success" in daemon_output, daemon_output
         assert "rejected configure_phy" not in daemon_output, daemon_output
+        assert "Failed to open posix file" not in daemon_output, daemon_output
+        assert "No radio instance available to provide entropy" not in daemon_output, daemon_output
         assert broker.returncode == 0, (
             f"startup-test broker exited with status {broker.returncode}:\n{broker_output}"
         )

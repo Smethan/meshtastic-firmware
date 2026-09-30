@@ -6,7 +6,7 @@
 
 #include "configuration.h"
 
-#if HAS_RADIO
+#if HAS_RADIO && !defined(ARCH_PORTDUINO)
 #include "RadioLibInterface.h"
 #endif
 
@@ -50,7 +50,7 @@ void fillWithRandomDevice(uint8_t *buffer, size_t length)
     }
 }
 
-#if HAS_RADIO
+#if HAS_RADIO && !defined(ARCH_PORTDUINO)
 bool mixWithLoRaEntropy(uint8_t *buffer, size_t length)
 {
     // Only attempt to pull entropy from the modem if it is initialized and exposes the helper.
@@ -162,7 +162,7 @@ bool fill(uint8_t *buffer, size_t length, bool useRadioEntropy)
         filled = true;
     }
 
-#if HAS_RADIO
+#if HAS_RADIO && !defined(ARCH_PORTDUINO)
     if (useRadioEntropy) {
         // Best-effort: if the radio is active and can provide modem entropy, XOR it over the
         // buffer to improve overall quality. We consider the filling a success if either a
@@ -170,6 +170,12 @@ bool fill(uint8_t *buffer, size_t length, bool useRadioEntropy)
         // least one of those steps succeeded.
         filled = mixWithLoRaEntropy(buffer, length) || filled;
     }
+#else
+    // Portduino already filled the buffer from the host CSPRNG above.  Do not
+    // reach through a physical RadioLib singleton: broker-backed builds have
+    // no such object, and direct Portduino builds do not need weaker modem
+    // entropy mixed over getrandom()/arc4random_buf()/BCryptGenRandom().
+    (void)useRadioEntropy;
 #endif
 
     return filled;
