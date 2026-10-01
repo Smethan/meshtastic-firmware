@@ -330,6 +330,11 @@ def main() -> int:
             meshtastic_request_id = configure_and_start(
                 meshtastic, generation, 2)
 
+            # An activation request itself proves that the controller is
+            # alive. Let its original timestamp age past the normal timeout,
+            # then verify that activating MeshCore refreshes the lease instead
+            # of immediately beginning a fallback during PHY setup.
+            time.sleep(5.2)
             switch = request(controller, generation, 3, "activate_mode", mode="meshcore")
             assert switch["ok"] and switch["result"]["pending"]
             revoke = receive(meshtastic, event="prepare_revoke")

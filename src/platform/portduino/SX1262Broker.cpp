@@ -1135,8 +1135,16 @@ class Broker
 
     bool requireController(Client &client, const Json::Value &requestId)
     {
-        if (client.role == "controller" && client.connectionId == controllerConnection)
+        if (client.role == "controller" && client.connectionId == controllerConnection) {
+            // Any authenticated controller operation proves that WDG is
+            // alive. In particular, activate_mode may be followed by a new
+            // protocol connection before the one-second heartbeat worker has
+            // emitted its first tick. Refreshing the lease here prevents an
+            // old timestamp from expiring the newly activated mode while its
+            // PHY is being configured.
+            lastHeartbeat = Clock::now();
             return true;
+        }
         sendError(client, requestId, "unauthorized", "WDG controller role is required");
         return false;
     }
