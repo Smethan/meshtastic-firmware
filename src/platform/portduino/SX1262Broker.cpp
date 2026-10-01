@@ -36,6 +36,7 @@ namespace
 using Clock = std::chrono::steady_clock;
 constexpr auto HEARTBEAT_TIMEOUT = std::chrono::seconds(5);
 constexpr auto QUIESCE_TIMEOUT = std::chrono::seconds(5);
+constexpr auto POWER_OFF_QUIESCE_TIMEOUT = std::chrono::seconds(2);
 
 volatile sig_atomic_t stopRequested = 0;
 
@@ -192,7 +193,7 @@ class RadioBackend
 {
   public:
     virtual ~RadioBackend() = default;
-    virtual int probe() = 0;
+    virtual int initialize() = 0;
     virtual int reset() = 0;
     virtual int configure(const PhyConfig &) = 0;
     virtual int startReceive() = 0;
@@ -209,15 +210,56 @@ class RadioBackend
 class FakeRadioBackend final : public RadioBackend
 {
   public:
-    int probe() override { return RADIOLIB_ERR_NONE; }
-    int reset() override { return RADIOLIB_ERR_NONE; }
-    int configure(const PhyConfig &) override { return RADIOLIB_ERR_NONE; }
-    int startReceive() override { return RADIOLIB_ERR_NONE; }
+    FakeRadioBackend()
+    {
+        if (const char *value = getenv("WATCHDOGS_SX1262_FAKE_FAIL_INITIALIZE_AFTER"))
+            failInitializeAfter = std::max(0, atoi(value));
+    }
+
+    int initialize() override
+    {
+        ++initializeCount;
+        if (failInitializeAfter > 0 && initializeCount >= failInitializeAfter)
+            return RADIOLIB_ERR_CHIP_NOT_FOUND;
+        initialized = true;
+        configured = false;
+        receiving = false;
+        return RADIOLIB_ERR_NONE;
+    }
+    int reset() override
+    {
+        initialized = false;
+        configured = false;
+        receiving = false;
+        transmitting = false;
+        return RADIOLIB_ERR_NONE;
+    }
+    int configure(const PhyConfig &) override
+    {
+        if (!initialized)
+            return RADIOLIB_ERR_WRONG_MODEM;
+        configured = true;
+        return RADIOLIB_ERR_NONE;
+    }
+    int startReceive() override
+    {
+        if (!initialized || !configured)
+            return RADIOLIB_ERR_WRONG_MODEM;
+        receiving = true;
+        return RADIOLIB_ERR_NONE;
+    }
     int standby() override { return RADIOLIB_ERR_NONE; }
-    int sleep() override { return RADIOLIB_ERR_NONE; }
-    int cad() override { return RADIOLIB_CHANNEL_FREE; }
+    int sleep() override
+    {
+        receiving = false;
+        return RADIOLIB_ERR_NONE;
+    }
+    int cad() override { return initialized && configured ? RADIOLIB_CHANNEL_FREE : RADIOLIB_ERR_WRONG_MODEM; }
     int startTransmit(const uint8_t *, size_t) override
     {
+        if (!initialized || !configured)
+            return RADIOLIB_ERR_WRONG_MODEM;
+        receiving = false;
         transmitting = true;
         return RADIOLIB_ERR_NONE;
     }
@@ -232,7 +274,12 @@ class FakeRadioBackend final : public RadioBackend
     bool receive(std::vector<uint8_t> &, float &, float &, float &) override { return false; }
 
   private:
+    bool initialized = false;
+    bool configured = false;
+    bool receiving = false;
     bool transmitting = false;
+    int initializeCount = 0;
+    int failInitializeAfter = 0;
 };
 
 class RadioLibSX1262Backend final : public RadioBackend
@@ -246,7 +293,7 @@ class RadioLibSX1262Backend final : public RadioBackend
     {
     }
 
-    int probe() override
+    int initialize() override
     {
         const float tcxo = static_cast<float>(portduino_config.dio3_tcxo_voltage) / 1000.0f;
         int result = radio.begin(915.0, 125.0, 7, 5, 0x12, 10, 8, tcxo, false);
@@ -379,9 +426,9 @@ class Broker
         state = forcedOff ? Mode::OFF : Mode::STARTING;
         if (!forcedOff) {
             setRail(true);
-            const int probe = radio->probe();
-            if (probe != RADIOLIB_ERR_NONE) {
-                enterFault("probe", probe);
+            const int result = radio->initialize();
+            if (result != RADIOLIB_ERR_NONE) {
+                enterFault("initialize", result);
             } else {
                 state = Mode::MESHTASTIC;
                 ++generation;
@@ -469,8 +516,13 @@ class Broker
             if ((state == Mode::MESHCORE || state == Mode::RETICULUM) && !forcedOff)
                 requestTransition(Mode::MESHTASTIC);
         }
-        if (transitionWaitingConnection && !clientByConnection(transitionWaitingConnection))
-            finishTransition();
+        if (transitionWaitingConnection && !clientByConnection(transitionWaitingConnection)) {
+            transitionWaitingConnection = 0;
+            if (powerOffPending)
+                completePowerOff(false);
+            else
+                finishTransition();
+        }
     }
 
     void serviceClient(size_t index, short revents)
@@ -545,12 +597,16 @@ class Broker
             sendError(client, requestId, "invalid_envelope", "Request envelope is incomplete");
             return;
         }
+        const std::string operation = request.get("op", "").asString();
         const uint64_t requestGeneration = request.get("generation", Json::UInt64(0)).asUInt64();
         if (requestGeneration != generation) {
+            if (operation == "quiesced" && forcedOff && state == Mode::OFF) {
+                sendSuccess(client, requestId, Json::Value(Json::objectValue));
+                return;
+            }
             sendError(client, requestId, "stale_generation", "Radio ownership generation has changed");
             return;
         }
-        const std::string operation = request.get("op", "").asString();
         if (operation == "get_status") {
             sendSuccess(client, requestId, status());
             return;
@@ -570,6 +626,10 @@ class Broker
                 sendError(client, requestId, "invalid_mode", "Expected meshtastic, meshcore, or reticulum");
                 return;
             }
+            if (powerOffPending) {
+                sendError(client, requestId, "power_transition", "Administrative power-off is in progress");
+                return;
+            }
             if (forcedOff || state == Mode::OFF) {
                 sendError(client, requestId, "forced_off", "Administrative force-off is active");
                 return;
@@ -584,6 +644,10 @@ class Broker
         if (operation == "release_mode") {
             if (!requireController(client, requestId))
                 return;
+            if (powerOffPending) {
+                sendError(client, requestId, "power_transition", "Administrative power-off is in progress");
+                return;
+            }
             requestTransition(Mode::MESHTASTIC);
             sendSuccess(client, requestId, Json::Value(Json::objectValue));
             return;
@@ -592,12 +656,18 @@ class Broker
             if (!requireController(client, requestId))
                 return;
             forcePowerOff();
-            sendSuccess(client, requestId, status());
+            Json::Value result = status();
+            result["pending"] = powerOffPending;
+            sendSuccess(client, requestId, result);
             return;
         }
         if (operation == "admin_power_on") {
             if (!requireController(client, requestId))
                 return;
+            if (powerOffPending) {
+                sendError(client, requestId, "power_transition", "Administrative power-off is in progress");
+                return;
+            }
             const Mode preferred = request.isMember("mode") ? parseMode(request["mode"].asString()) : Mode::MESHTASTIC;
             if (preferred == Mode::FAULT) {
                 sendError(client, requestId, "invalid_mode", "Invalid preferred mode");
@@ -621,12 +691,20 @@ class Broker
             return;
         }
         if (operation == "quiesced") {
+            if (forcedOff && state == Mode::OFF) {
+                sendSuccess(client, requestId, Json::Value(Json::objectValue));
+                return;
+            }
             if (state != Mode::TRANSITION || client.connectionId != transitionWaitingConnection) {
                 sendError(client, requestId, "not_revoking", "Client is not being revoked");
                 return;
             }
             sendSuccess(client, requestId, Json::Value(Json::objectValue));
-            finishTransition();
+            transitionWaitingConnection = 0;
+            if (powerOffPending)
+                completePowerOff(false);
+            else
+                finishTransition();
             return;
         }
         if (!isActiveProtocol(client)) {
@@ -726,6 +804,8 @@ class Broker
 
     void requestTransition(Mode target)
     {
+        if (powerOffPending)
+            return;
         if (state == target)
             return;
         if (state == Mode::TRANSITION) {
@@ -733,9 +813,11 @@ class Broker
             return;
         }
         transitionTarget = target;
+        transitionSource = state;
         const char *oldRole = roleForMode(state);
         Client *oldClient = clientByRole(oldRole);
         state = Mode::TRANSITION;
+        transitionStage = "quiescing";
         receiving = false;
         transitionDeadline = Clock::now() + QUIESCE_TIMEOUT;
         transitionWaitingConnection = oldClient ? oldClient->connectionId : 0;
@@ -751,14 +833,34 @@ class Broker
             transitionRadioDeadline = Clock::now() + std::chrono::seconds(15);
             return;
         }
-        radio->standby();
-        radio->reset();
+        transitionStage = "standby";
+        int result = radio->standby();
+        if (result != RADIOLIB_ERR_NONE) {
+            enterFault("transition_standby", result);
+            return;
+        }
         ++generation;
+        broadcastEvent("lease_revoked");
+        transitionStage = "reset";
+        result = radio->reset();
+        if (result != RADIOLIB_ERR_NONE) {
+            enterFault("transition_reset", result);
+            return;
+        }
+        transitionStage = "initialize";
+        result = radio->initialize();
+        if (result != RADIOLIB_ERR_NONE) {
+            enterFault("transition_initialize", result);
+            return;
+        }
         state = transitionTarget;
         transitionWaitingConnection = 0;
         receiving = false;
+        transitionStage.clear();
+        faultDetail.clear();
+        fprintf(stderr, "watchdogs-sx1262d transition %s -> %s generation %llu ready\n", modeName(transitionSource),
+                modeName(state), static_cast<unsigned long long>(generation));
         Client *newClient = clientByRole(roleForMode(state));
-        broadcastEvent("lease_revoked");
         if (newClient)
             sendEvent(*newClient, "lease_granted");
     }
@@ -774,6 +876,14 @@ class Broker
     void processTimeouts()
     {
         const auto now = Clock::now();
+        if (powerOffPending) {
+            if (now >= transitionDeadline) {
+                completePowerOff(true);
+            } else if (transitionWaitingConnection == 0 && txOwnerConnection == 0) {
+                completePowerOff(false);
+            }
+            return;
+        }
         if (state == Mode::TRANSITION && transitionWaitingConnection && now >= transitionDeadline) {
             // Fail closed: keep TRANSITION, revoke the old generation, and expose
             // neither frontend until the process exits or proves quiescence.
@@ -843,9 +953,10 @@ class Broker
     {
         setRail(true);
         usleep(100000);
-        const int result = radio->probe();
+        transitionStage = "initialize";
+        const int result = radio->initialize();
         if (result != RADIOLIB_ERR_NONE) {
-            enterFault("probe", result);
+            enterFault("power_on_initialize", result);
             return false;
         }
         forcedOff = false;
@@ -853,6 +964,7 @@ class Broker
         ++generation;
         state = preferred;
         faultDetail.clear();
+        transitionStage.clear();
         broadcastEvent("power_changed");
         if (Client *client = clientByRole(roleForMode(state)))
             sendEvent(*client, "lease_granted");
@@ -861,18 +973,52 @@ class Broker
 
     void forcePowerOff()
     {
+        if (forcedOff && state == Mode::OFF)
+            return;
+        if (powerOffPending)
+            return;
+        const bool transitionInProgress = state == Mode::TRANSITION;
+        const Mode source = transitionInProgress ? transitionSource : state;
+        Client *oldClient =
+            transitionInProgress ? clientByConnection(transitionWaitingConnection) : clientByRole(roleForMode(source));
+        transitionSource = source;
+        transitionTarget = Mode::OFF;
         state = Mode::TRANSITION;
-        broadcastEvent("prepare_revoke");
+        transitionStage = "quiescing_for_power_off";
+        powerOffPending = true;
+        transitionDeadline = Clock::now() + POWER_OFF_QUIESCE_TIMEOUT;
+        transitionWaitingConnection = oldClient ? oldClient->connectionId : 0;
         receiving = false;
-        txOwnerConnection = 0;
-        radio->standby();
-        radio->sleep();
+        if (oldClient && !transitionInProgress)
+            sendEvent(*oldClient, "prepare_revoke");
+        else if (!oldClient)
+            completePowerOff(false);
+    }
+
+    void completePowerOff(bool force)
+    {
+        if (!powerOffPending)
+            return;
+        if (!force && (transitionWaitingConnection != 0 || txOwnerConnection != 0))
+            return;
+        transitionStage = "powering_off";
+        transitionWaitingConnection = 0;
+        if (force)
+            txOwnerConnection = 0;
+        const int standbyResult = radio->standby();
+        const int sleepResult = radio->sleep();
         setRail(false);
-        persistForcedOff();
+        if (!persistForcedOff())
+            return;
         forcedOff = true;
         state = Mode::OFF;
         ++generation;
+        powerOffPending = false;
+        transitionStage.clear();
+        broadcastEvent("lease_revoked");
         broadcastEvent("power_changed");
+        if (standbyResult != RADIOLIB_ERR_NONE || sleepResult != RADIOLIB_ERR_NONE)
+            fprintf(stderr, "watchdogs-sx1262d forced power-off cleanup standby=%d sleep=%d\n", standbyResult, sleepResult);
     }
 
     void setRail(bool enabled)
@@ -886,7 +1032,7 @@ class Broker
         railPowered = enabled;
     }
 
-    void persistForcedOff()
+    bool persistForcedOff()
     {
         const std::string temporary = forcedOffPath + ".tmp." + std::to_string(getpid());
         {
@@ -898,7 +1044,10 @@ class Broker
         if (rename(temporary.c_str(), forcedOffPath.c_str()) < 0) {
             unlink(temporary.c_str());
             enterFault("persist_forced_off", errno);
+            powerOffPending = false;
+            return false;
         }
+        return true;
     }
 
     void enterFault(const char *stage, int error)
@@ -908,7 +1057,12 @@ class Broker
         radio->sleep();
         setRail(false);
         state = Mode::FAULT;
+        powerOffPending = false;
+        transitionWaitingConnection = 0;
+        transitionStage = stage;
         faultDetail = std::string(stage) + " failed: " + std::to_string(error);
+        fprintf(stderr, "watchdogs-sx1262d fault stage=%s error=%d generation=%llu\n", stage, error,
+                static_cast<unsigned long long>(generation));
         broadcastEvent("radio_fault");
     }
 
@@ -921,7 +1075,10 @@ class Broker
         result["power"] = railPowered;
         result["forced_off"] = forcedOff;
         result["fault"] = faultDetail;
-        result["broker_version"] = "1.0";
+        result["broker_version"] = "1.1";
+        result["transition_stage"] = transitionStage;
+        result["target_mode"] = state == Mode::TRANSITION ? modeName(transitionTarget) : "";
+        result["power_transition_pending"] = powerOffPending;
         result["lease_age_ms"] =
             Json::UInt64(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - lastHeartbeat).count());
         result["metrics"] = metrics();
@@ -1027,6 +1184,7 @@ class Broker
     uint64_t generation = 1;
     uint64_t controllerConnection = 0;
     Mode state = Mode::STARTING;
+    Mode transitionSource = Mode::STARTING;
     Mode transitionTarget = Mode::MESHTASTIC;
     uint64_t transitionWaitingConnection = 0;
     uint64_t txOwnerConnection = 0;
@@ -1036,6 +1194,8 @@ class Broker
     bool forcedOff = false;
     bool railPowered = false;
     bool receiving = false;
+    bool powerOffPending = false;
+    std::string transitionStage;
     std::string faultDetail;
     uint64_t rxPackets = 0;
     uint64_t rxDrops = 0;

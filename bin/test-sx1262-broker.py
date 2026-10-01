@@ -36,11 +36,12 @@ def hello(path: Path, role: str) -> tuple[socket.socket, int]:
     sock.connect(str(path))
     send(sock, {
         "type": "hello", "request_id": 1,
-        "api": {"major": 1, "minor": 0}, "role": role,
+        "api": {"major": 1, "minor": 1}, "role": role,
     })
     reply = receive(sock)
     assert reply["ok"], reply
     assert reply["result"]["api"]["major"] == 1
+    assert reply["result"]["api"]["minor"] >= 1
     return sock, reply["result"]["generation"]
 
 
@@ -54,6 +55,29 @@ def request(sock: socket.socket, generation: int, request_id: int,
         reply = receive(sock)
         if reply.get("type") == "response" and reply.get("request_id") == request_id:
             return reply
+
+
+def configure_and_start(sock: socket.socket, generation: int,
+                        request_id: int) -> int:
+    configured = request(
+        sock, generation, request_id, "configure_phy",
+        phy={
+            "frequency": 915_000_000,
+            "bandwidth": 125_000,
+            "spreading_factor": 7,
+            "coding_rate": 5,
+            "sync_word": 0x12,
+            "preamble_length": 8,
+            "header_mode": "explicit",
+            "crc": True,
+            "iq_inversion": False,
+            "tx_power": 22,
+        },
+    )
+    assert configured["ok"], configured
+    started = request(sock, generation, request_id + 1, "start_rx")
+    assert started["ok"], started
+    return request_id + 2
 
 
 def test_role_authentication(binary: Path) -> None:
@@ -96,7 +120,7 @@ def test_role_authentication(binary: Path) -> None:
             disallowed.connect(str(sock_path))
             send(disallowed, {
                 "type": "hello", "request_id": 2,
-                "api": {"major": 1, "minor": 0}, "role": "controller",
+                "api": {"major": 1, "minor": 1}, "role": "controller",
             })
             rejected = receive(disallowed)
             assert not rejected["ok"], rejected
@@ -123,6 +147,58 @@ def stop_process(process: subprocess.Popen) -> str:
         process.kill()
         process.wait(timeout=5)
     return process.stdout.read()
+
+
+def test_transition_initialization_failure(binary: Path) -> None:
+    """A post-reset init failure must fault without granting the target."""
+    with tempfile.TemporaryDirectory(prefix="sx1262-broker-init-fail-") as temporary:
+        root = Path(temporary)
+        config = root / "sx1262.yaml"
+        config.write_text("Lora:\n  Module: sim\n", encoding="utf-8")
+        sock_path = root / "sx1262d.sock"
+        environment = os.environ.copy()
+        environment["WATCHDOGS_SX1262_SOCKET"] = str(sock_path)
+        environment["WATCHDOGS_SX1262_FORCED_OFF"] = str(root / "forced-off")
+        environment["WATCHDOGS_SX1262_FAKE_FAIL_INITIALIZE_AFTER"] = "2"
+        process = subprocess.Popen(
+            [str(binary), "--sx1262-manager-fake", f"--config={config}",
+             f"--fsdir={root / 'fs'}"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not sock_path.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError(process.stdout.read())
+                time.sleep(0.02)
+            meshtastic, generation = hello(sock_path, "meshtastic")
+            assert receive(meshtastic, event="lease_granted")
+            meshcore, _ = hello(sock_path, "meshcore")
+            controller, _ = hello(sock_path, "controller")
+            switched = request(
+                controller, generation, 2, "activate_mode", mode="meshcore")
+            assert switched["ok"] and switched["result"]["pending"]
+            revoke = receive(meshtastic, event="prepare_revoke")
+            assert request(meshtastic, revoke["generation"], 2, "quiesced")["ok"]
+            fault = receive(meshcore, event="radio_fault")
+            generation = fault["generation"]
+            status = request(controller, generation, 3, "get_status")
+            assert status["result"]["state"] == "FAULT"
+            assert status["result"]["power"] is False
+            assert "transition_initialize failed" in status["result"]["fault"]
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        output = process.stdout.read()
+        assert process.returncode == 0, output
+        assert "transition_initialize" in output
 
 
 def test_meshtastic_broker_startup(binary: Path) -> None:
@@ -216,6 +292,7 @@ def main() -> int:
     binary = Path(sys.argv[1]).resolve()
     test_role_authentication(binary)
     test_meshtastic_broker_startup(binary)
+    test_transition_initialization_failure(binary)
     with tempfile.TemporaryDirectory(prefix="sx1262-broker-") as temporary:
         root = Path(temporary)
         config = root / "sx1262.yaml"
@@ -250,6 +327,9 @@ def main() -> int:
             status = request(controller, generation, 2, "get_status")
             assert status["result"]["state"] == "MESHTASTIC"
 
+            meshtastic_request_id = configure_and_start(
+                meshtastic, generation, 2)
+
             switch = request(controller, generation, 3, "activate_mode", mode="meshcore")
             assert switch["ok"] and switch["result"]["pending"]
             revoke = receive(meshtastic, event="prepare_revoke")
@@ -258,6 +338,8 @@ def main() -> int:
             granted = receive(meshcore, event="lease_granted")
             generation = granted["generation"]
             assert generation > controller_generation
+            meshcore_request_id = configure_and_start(
+                meshcore, generation, 2)
 
             stale = request(controller, controller_generation, 4, "heartbeat")
             assert not stale["ok"] and stale["error"]["code"] == "stale_generation"
@@ -270,22 +352,50 @@ def main() -> int:
             time.sleep(5.2)
             timed_out = receive(meshcore, event="prepare_revoke")
             assert request(
-                meshcore, timed_out["generation"], 2, "quiesced")["ok"]
+                meshcore, timed_out["generation"], meshcore_request_id,
+                "quiesced")["ok"]
             recovered = receive(meshtastic, event="lease_granted")
             generation = recovered["generation"]
+            meshtastic_request_id = configure_and_start(
+                meshtastic, generation, meshtastic_request_id)
             status = request(controller, generation, 6, "get_status")
             assert status["result"]["state"] == "MESHTASTIC"
 
             powered_off = request(controller, generation, 7, "admin_power_off")
             assert powered_off["ok"]
-            generation = powered_off["generation"]
-            assert powered_off["result"]["state"] == "OFF"
+            assert powered_off["result"]["pending"]
+            assert powered_off["result"]["state"] == "TRANSITION"
+            revoke = receive(meshtastic, event="prepare_revoke")
+            assert request(
+                meshtastic, revoke["generation"], meshtastic_request_id,
+                "quiesced")["ok"]
+            changed = receive(controller, event="power_changed")
+            generation = changed["generation"]
+            status = request(controller, generation, 8, "get_status")
+            assert status["result"]["state"] == "OFF"
             assert forced_off.is_file()
 
-            powered_on = request(controller, generation, 8, "admin_power_on", mode="meshtastic")
+            powered_on = request(controller, generation, 9, "admin_power_on", mode="meshtastic")
             assert powered_on["ok"]
             assert powered_on["result"]["state"] == "MESHTASTIC"
             assert not forced_off.exists()
+            generation = powered_on["generation"]
+            granted = receive(meshtastic, event="lease_granted")
+            assert granted["generation"] == generation
+            meshtastic_request_id = configure_and_start(
+                meshtastic, generation, meshtastic_request_id + 1)
+
+            # A stuck client cannot keep the rail on past the two-second
+            # administrative shutdown deadline.
+            powered_off = request(controller, generation, 10, "admin_power_off")
+            assert powered_off["ok"] and powered_off["result"]["pending"]
+            assert receive(meshtastic, event="prepare_revoke")
+            changed = receive(controller, event="power_changed")
+            generation = changed["generation"]
+            status = request(controller, generation, 11, "get_status")
+            assert status["result"]["state"] == "OFF"
+            assert status["result"]["forced_off"] is True
+            assert status["result"]["power"] is False
         finally:
             process.terminate()
             try:

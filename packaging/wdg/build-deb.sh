@@ -157,7 +157,7 @@ print(json.dumps({
     "source_ref": source_ref,
     "license": "GPL-3.0-only",
     "wdg_api": {"major": 1, "minor": 1},
-    "sx1262_broker_api": {"major": 1, "minor": 0},
+    "sx1262_broker_api": {"major": 1, "minor": 1},
     "package": {
         "name": "meshtasticd-wdg",
         "version": version,
@@ -191,7 +191,7 @@ print(json.dumps({
     "source_ref": source_ref,
     "license": "GPL-3.0-only",
     "wdg_api": {"major": 1, "minor": 1},
-    "sx1262_broker_api": {"major": 1, "minor": 0},
+    "sx1262_broker_api": {"major": 1, "minor": 1},
     "package": {
         "name": "meshtasticd-wdg",
         "version": version,

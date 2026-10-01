@@ -234,7 +234,7 @@ bool BrokerRadioInterface::connectBroker()
     Json::Value hello(Json::objectValue);
     hello["type"] = "hello";
     hello["api"]["major"] = 1;
-    hello["api"]["minor"] = 0;
+    hello["api"]["minor"] = 1;
     hello["role"] = "meshtastic";
     hello["pid"] = getpid();
     hello["request_id"] = Json::UInt64(++requestId);
@@ -311,14 +311,15 @@ bool BrokerRadioInterface::request(const char *operation, const Json::Value &arg
         }
         if (response.get("request_id", Json::UInt64(0)).asUInt64() != expected)
             return false;
-        if (!response.get("ok", false).asBool()) {
-            LOG_WARN("SX1262 broker rejected %s: %s", operation, response["error"].get("message", "unknown").asCString());
-            return false;
-        }
         const uint64_t responseGeneration = response.get("generation", Json::UInt64(generation)).asUInt64();
         if (responseGeneration != generation) {
             generation = responseGeneration;
+            leaseReady = false;
             dropQueue();
+        }
+        if (!response.get("ok", false).asBool()) {
+            LOG_WARN("SX1262 broker rejected %s: %s", operation, response["error"].get("message", "unknown").asCString());
+            return false;
         }
         result = response["result"];
         return true;
@@ -381,8 +382,12 @@ void BrokerRadioInterface::processEvent(const Json::Value &event)
     }
     if (name == "lease_granted") {
         leaseReady = true;
-        configureBroker();
-        setBluetoothEnable(true);
+        if (configureBroker()) {
+            setBluetoothEnable(true);
+        } else {
+            leaseReady = false;
+            LOG_ERROR("SX1262 broker lease could not be configured");
+        }
     } else if (name == "prepare_revoke") {
         leaseReady = false;
         dropQueue();

@@ -6,7 +6,7 @@ namespace meshtastic::portduino
 {
 
 inline constexpr int SX1262_BROKER_API_MAJOR = 1;
-inline constexpr int SX1262_BROKER_API_MINOR = 0;
+inline constexpr int SX1262_BROKER_API_MINOR = 1;
 inline constexpr int SX1262_BROKER_MAX_PACKET = 4096;
 inline constexpr int SX1262_BROKER_MAX_PAYLOAD = 255;
 
