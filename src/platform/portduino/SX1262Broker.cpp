@@ -509,11 +509,20 @@ class Broker
     void removeClient(size_t index)
     {
         const std::string role = clients[index].role;
+        const uint64_t connectionId = clients[index].connectionId;
+        const bool heldActiveLease = connectionId == activeProtocolConnection;
         close(clients[index].fd);
         clients.erase(clients.begin() + index);
         if (role == "controller") {
             controllerConnection = 0;
             if ((state == Mode::MESHCORE || state == Mode::RETICULUM) && !forcedOff)
+                requestTransition(Mode::MESHTASTIC);
+        }
+        if (heldActiveLease) {
+            activeProtocolConnection = 0;
+            receiving = false;
+            protocolReady = false;
+            if (state == Mode::MESHCORE || state == Mode::RETICULUM)
                 requestTransition(Mode::MESHTASTIC);
         }
         if (transitionWaitingConnection && !clientByConnection(transitionWaitingConnection)) {
@@ -574,6 +583,17 @@ class Broker
             sendError(client, requestId, "role_busy", "A WDG controller is already connected");
             return;
         }
+        Client *activeClient = clientByConnection(activeProtocolConnection);
+        if (role != "controller" && role == roleForMode(state) && activeClient &&
+            activeClient->connectionId == txOwnerConnection) {
+            sendError(client, requestId, "role_busy", "The active protocol has a transmission in flight");
+            return;
+        }
+        if (role != "controller" && role == roleForMode(state) && activeClient &&
+            activeClient->connectionId != client.connectionId && activeClient->pid != client.pid && !peerClosed(*activeClient)) {
+            sendError(client, requestId, "role_busy", "The active protocol already has a live client");
+            return;
+        }
         client.role = role;
         client.hello = true;
         if (role == "controller") {
@@ -586,8 +606,15 @@ class Broker
         result["connection_id"] = Json::UInt64(client.connectionId);
         result["generation"] = Json::UInt64(generation);
         sendSuccess(client, requestId, result);
-        if (!forcedOff && role == roleForMode(state))
-            sendEvent(client, "lease_granted");
+        if (!forcedOff && role == roleForMode(state)) {
+            // A protocol client reconnecting from the same process supersedes
+            // its prior socket. This closes the small close/accept race seen
+            // during rapid WDG mode changes while retaining one connection-
+            // bound owner for every generation.
+            if (activeClient && activeClient->connectionId != client.connectionId)
+                sendEvent(*activeClient, "lease_revoked");
+            grantLease(client);
+        }
     }
 
     void handleRequest(Client &client, const Json::Value &request)
@@ -729,11 +756,14 @@ class Broker
         } else if (operation == "start_rx") {
             result = radio->startReceive();
             receiving = result == RADIOLIB_ERR_NONE;
+            protocolReady = receiving;
         } else if (operation == "standby") {
             receiving = false;
+            protocolReady = false;
             result = radio->standby();
         } else if (operation == "sleep") {
             receiving = false;
+            protocolReady = false;
             result = radio->sleep();
         } else if (operation == "cad") {
             result = radio->cad();
@@ -814,11 +844,11 @@ class Broker
         }
         transitionTarget = target;
         transitionSource = state;
-        const char *oldRole = roleForMode(state);
-        Client *oldClient = clientByRole(oldRole);
+        Client *oldClient = clientByConnection(activeProtocolConnection);
         state = Mode::TRANSITION;
         transitionStage = "quiescing";
         receiving = false;
+        protocolReady = false;
         transitionDeadline = Clock::now() + QUIESCE_TIMEOUT;
         transitionWaitingConnection = oldClient ? oldClient->connectionId : 0;
         if (oldClient)
@@ -840,6 +870,8 @@ class Broker
             return;
         }
         ++generation;
+        activeProtocolConnection = 0;
+        protocolReady = false;
         broadcastEvent("lease_revoked");
         transitionStage = "reset";
         result = radio->reset();
@@ -860,9 +892,7 @@ class Broker
         faultDetail.clear();
         fprintf(stderr, "watchdogs-sx1262d transition %s -> %s generation %llu ready\n", modeName(transitionSource),
                 modeName(state), static_cast<unsigned long long>(generation));
-        Client *newClient = clientByRole(roleForMode(state));
-        if (newClient)
-            sendEvent(*newClient, "lease_granted");
+        grantLeaseForRole(roleForMode(state));
     }
 
     void activateImmediately(Mode target)
@@ -929,7 +959,7 @@ class Broker
         }
         if (!receiving || state == Mode::TRANSITION || forcedOff)
             return;
-        Client *owner = clientByRole(roleForMode(state));
+        Client *owner = clientByConnection(activeProtocolConnection);
         if (!owner)
             return;
         std::vector<uint8_t> payload;
@@ -963,11 +993,12 @@ class Broker
         unlink(forcedOffPath.c_str());
         ++generation;
         state = preferred;
+        activeProtocolConnection = 0;
+        protocolReady = false;
         faultDetail.clear();
         transitionStage.clear();
         broadcastEvent("power_changed");
-        if (Client *client = clientByRole(roleForMode(state)))
-            sendEvent(*client, "lease_granted");
+        grantLeaseForRole(roleForMode(state));
         return true;
     }
 
@@ -980,7 +1011,7 @@ class Broker
         const bool transitionInProgress = state == Mode::TRANSITION;
         const Mode source = transitionInProgress ? transitionSource : state;
         Client *oldClient =
-            transitionInProgress ? clientByConnection(transitionWaitingConnection) : clientByRole(roleForMode(source));
+            transitionInProgress ? clientByConnection(transitionWaitingConnection) : clientByConnection(activeProtocolConnection);
         transitionSource = source;
         transitionTarget = Mode::OFF;
         state = Mode::TRANSITION;
@@ -989,6 +1020,7 @@ class Broker
         transitionDeadline = Clock::now() + POWER_OFF_QUIESCE_TIMEOUT;
         transitionWaitingConnection = oldClient ? oldClient->connectionId : 0;
         receiving = false;
+        protocolReady = false;
         if (oldClient && !transitionInProgress)
             sendEvent(*oldClient, "prepare_revoke");
         else if (!oldClient)
@@ -1012,6 +1044,8 @@ class Broker
             return;
         forcedOff = true;
         state = Mode::OFF;
+        activeProtocolConnection = 0;
+        protocolReady = false;
         ++generation;
         powerOffPending = false;
         transitionStage.clear();
@@ -1057,6 +1091,8 @@ class Broker
         radio->sleep();
         setRail(false);
         state = Mode::FAULT;
+        activeProtocolConnection = 0;
+        protocolReady = false;
         powerOffPending = false;
         transitionWaitingConnection = 0;
         transitionStage = stage;
@@ -1079,6 +1115,8 @@ class Broker
         result["transition_stage"] = transitionStage;
         result["target_mode"] = state == Mode::TRANSITION ? modeName(transitionTarget) : "";
         result["power_transition_pending"] = powerOffPending;
+        result["lease_connection_id"] = Json::UInt64(activeProtocolConnection);
+        result["protocol_ready"] = protocolReady;
         result["lease_age_ms"] =
             Json::UInt64(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - lastHeartbeat).count());
         result["metrics"] = metrics();
@@ -1103,16 +1141,44 @@ class Broker
         return false;
     }
 
-    bool isActiveProtocol(const Client &client) const { return !forcedOff && client.role == roleForMode(state); }
+    bool isActiveProtocol(const Client &client) const
+    {
+        return !forcedOff && client.connectionId != 0 && client.connectionId == activeProtocolConnection &&
+               client.role == roleForMode(state);
+    }
 
-    Client *clientByRole(const std::string &role)
+    bool peerClosed(const Client &client) const
+    {
+        pollfd descriptor{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int result = poll(&descriptor, 1, 0);
+        if (result > 0 && (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)))
+            return true;
+        if (result > 0 && (descriptor.revents & POLLIN)) {
+            char byte = 0;
+            return recv(client.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+        }
+        return false;
+    }
+
+    bool grantLease(Client &client)
+    {
+        activeProtocolConnection = 0;
+        receiving = false;
+        protocolReady = false;
+        if (!sendEvent(client, "lease_granted"))
+            return false;
+        activeProtocolConnection = client.connectionId;
+        return true;
+    }
+
+    bool grantLeaseForRole(const std::string &role)
     {
         if (role.empty())
-            return nullptr;
-        for (auto &client : clients)
-            if (client.hello && client.role == role)
-                return &client;
-        return nullptr;
+            return false;
+        for (auto client = clients.rbegin(); client != clients.rend(); ++client)
+            if (client->hello && client->role == role && grantLease(*client))
+                return true;
+        return false;
     }
 
     Client *clientByConnection(uint64_t connectionId)
@@ -1183,6 +1249,7 @@ class Broker
     uint64_t nextConnectionId = 1;
     uint64_t generation = 1;
     uint64_t controllerConnection = 0;
+    uint64_t activeProtocolConnection = 0;
     Mode state = Mode::STARTING;
     Mode transitionSource = Mode::STARTING;
     Mode transitionTarget = Mode::MESHTASTIC;
@@ -1194,6 +1261,7 @@ class Broker
     bool forcedOff = false;
     bool railPowered = false;
     bool receiving = false;
+    bool protocolReady = false;
     bool powerOffPending = false;
     std::string transitionStage;
     std::string faultDetail;

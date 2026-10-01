@@ -341,9 +341,30 @@ def main() -> int:
             meshcore_request_id = configure_and_start(
                 meshcore, generation, 2)
 
-            stale = request(controller, controller_generation, 4, "heartbeat")
+            # A reconnect from the active WDG process must atomically replace
+            # its prior socket. Ownership is connection-bound, not merely
+            # role-bound: the replacement can configure the radio while the
+            # superseded socket is rejected even though both authenticate as
+            # ``meshcore`` in the same generation.
+            replacement, replacement_generation = hello(sock_path, "meshcore")
+            assert replacement_generation == generation
+            replacement_grant = receive(replacement, event="lease_granted")
+            assert replacement_grant["generation"] == generation
+            meshcore_request_id = configure_and_start(
+                replacement, generation, 2)
+            superseded = request(
+                meshcore, generation, meshcore_request_id, "get_metrics")
+            assert not superseded["ok"], superseded
+            assert superseded["error"]["code"] == "not_owner", superseded
+            status = request(controller, generation, 4, "get_status")
+            assert status["result"]["protocol_ready"] is True
+            assert status["result"]["lease_connection_id"] > 0
+            meshcore.close()
+            meshcore = replacement
+
+            stale = request(controller, controller_generation, 5, "heartbeat")
             assert not stale["ok"] and stale["error"]["code"] == "stale_generation"
-            heartbeat = request(controller, generation, 5, "heartbeat")
+            heartbeat = request(controller, generation, 6, "heartbeat")
             assert heartbeat["ok"]
 
             # A missed controller lease must use the same quiescence barrier
@@ -358,10 +379,10 @@ def main() -> int:
             generation = recovered["generation"]
             meshtastic_request_id = configure_and_start(
                 meshtastic, generation, meshtastic_request_id)
-            status = request(controller, generation, 6, "get_status")
+            status = request(controller, generation, 7, "get_status")
             assert status["result"]["state"] == "MESHTASTIC"
 
-            powered_off = request(controller, generation, 7, "admin_power_off")
+            powered_off = request(controller, generation, 8, "admin_power_off")
             assert powered_off["ok"]
             assert powered_off["result"]["pending"]
             assert powered_off["result"]["state"] == "TRANSITION"
@@ -371,11 +392,11 @@ def main() -> int:
                 "quiesced")["ok"]
             changed = receive(controller, event="power_changed")
             generation = changed["generation"]
-            status = request(controller, generation, 8, "get_status")
+            status = request(controller, generation, 9, "get_status")
             assert status["result"]["state"] == "OFF"
             assert forced_off.is_file()
 
-            powered_on = request(controller, generation, 9, "admin_power_on", mode="meshtastic")
+            powered_on = request(controller, generation, 10, "admin_power_on", mode="meshtastic")
             assert powered_on["ok"]
             assert powered_on["result"]["state"] == "MESHTASTIC"
             assert not forced_off.exists()
@@ -387,12 +408,12 @@ def main() -> int:
 
             # A stuck client cannot keep the rail on past the two-second
             # administrative shutdown deadline.
-            powered_off = request(controller, generation, 10, "admin_power_off")
+            powered_off = request(controller, generation, 11, "admin_power_off")
             assert powered_off["ok"] and powered_off["result"]["pending"]
             assert receive(meshtastic, event="prepare_revoke")
             changed = receive(controller, event="power_changed")
             generation = changed["generation"]
-            status = request(controller, generation, 11, "get_status")
+            status = request(controller, generation, 12, "get_status")
             assert status["result"]["state"] == "OFF"
             assert status["result"]["forced_off"] is True
             assert status["result"]["power"] is False
